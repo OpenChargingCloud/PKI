@@ -1,0 +1,149 @@
+[
+    {
+        "@id":         "f19877e99f89e6b99f563c6c3c76413e714f1a45ebb0be4a3a2fc60c1b78ee4e",
+        "@context":    "https://open.charging.cloud/context/pkiCertificate",
+        "description": "Open Charging Cloud - Fundamental Quorum 1",
+        "publicKeys": [
+            {
+                "x":         "AMPVoJ4uB9wJRHx9Q6FzPopUmeEKUiQSfLVLLhNNm+e0tUieZUt7NtfRzfrTpjpllGrC4gGMB0lLCYQipeVllpI9",
+                "y":         "AQoHYwGUa4dj9nOF3XfL5X8ZmC/ZaTNSUAt3yGEAAwoK41HXmpJh4e5Ws0+6G3b87e5EyWeP4uVrZMNgfoM/Si4O",
+                "algorithm": "https://open.charging.cloud/context/certificates/algorithm/secp521r1",
+                "encoding":  "https://open.charging.cloud/context/certificates/encoding/base64"
+            }
+        ],
+        "usages": [
+            {
+                "@id": "https://open.charging.cloud/context/certificates/usages/signCertificates"
+            }
+        ],
+        "notBefore": "2023-01-01T00:00:00.000Z",
+        "notAfter":  "2028-01-01T00:00:00.000Z",
+        "owner": {
+            "name":        "GraphDefined GmbH",
+            "description": "GraphDefined E-Mobility Services",
+            "eMail":       "ev-pki@graphdefined.com",
+            "www":         "https://www.graphdefined.com"
+        },
+        "signatures": [
+            {
+                "@id":   "d88c67608f28df405ba9f2966a66acba54180c5547f2f5ea8ab75d98c7a31e03",
+                "name":  "Open Charging Cloud PKI - FQ1",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "AfDMpVnUNrVofRD/nKtYyraD26QBAU902QNgzRjxil29xtjh6THZuwbA15DtYjRUquWZHSAIKlFVVw0ohU35u+mL",
+                "s":     "AdLRfO5Is/RHVZLclwrIJI3xXW/NdATyA+uMKe7D+DOQBm0MstUbAExAC8PHTNLGSKU0sxDv8r39yF+9suTBjPpt"
+            },
+            {
+                "@id":   "c01417a2daa5f28b46fce52628ba1e01c86520bf48d88a7876579add1b9faf5d",
+                "name":  "Open Charging Cloud PKI - FQ2",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "fWvB2cpNnkcFFrVKbb2uwlSMdeeME+CuNCgECzArxSf199Eib2utlhzItECQ0FPwQQH9JTo3QoVETpZChbr/BOY=",
+                "s":     "AfL4jXSH9RxYzTHM68aKMSSYNmxdWvmFyjFEb/nKnp0I+3l6m840LYLVd9qPIxIc/NaY5DeSr5EAOiA33q6kGo11"
+            },
+            {
+                "@id":   "897dc26e2a71a7ce70efa252fdda532a0facbce44339ecab74acea87a099beed",
+                "name":  "Open Charging Cloud PKI - FQ3",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "AYGKPkBzqZDa9oHK2+jXMumneFvquCcXp6eS/eKQyhL/VOXUCbNIyiSphsFoUnqFWNVLn7489HUnmk8PjQc1fxkg",
+                "s":     "AXQRuhPQG33eL2WwSAvNCmCKCWCkUyLcxsiVCeMqHfaLc44cB0aEQV7Jq33spd7EYt1sG1ZBTLZyzLA5KnBZnJhu"
+            }
+        ]
+    },
+    {
+        "@id":         "54c6d674be63833bc09959da44cc38f2d67cbae89cc5dafd500863b1bfd552a4",
+        "@context":    "https://open.charging.cloud/context/pkiCertificate",
+        "description": "Open Charging Cloud - Fundamental Quorum 2",
+        "publicKeys": [
+            {
+                "x":         "AOTQUsPMLzvjk2pPDcDyOBIkl1Ff0TsJ+Pq9jh7ybVJtzyoqgp+rkmvjCNZ9IhEBgPR2qnmaylEvJNZm7UIAqLuQ",
+                "y":         "AYVQAMFnTbgLfxyk8wesyCnpdWulageegfe4Qo80xr+7ihIHAzelXtXVPdy43JsfSjWjERRwb9ZKoLnVN3wtQ5Or",
+                "algorithm": "https://open.charging.cloud/context/certificates/algorithm/secp521r1",
+                "encoding":  "https://open.charging.cloud/context/certificates/encoding/base64"
+            }
+        ],
+        "usages": [
+            {
+                "@id": "https://open.charging.cloud/context/certificates/usages/signCertificates"
+            }
+        ],
+        "notBefore": "2023-01-01T00:00:00.000Z",
+        "notAfter":  "2028-01-01T00:00:00.000Z",
+        "owner": {
+            "name":        "GraphDefined GmbH",
+            "description": "GraphDefined E-Mobility Services",
+            "eMail":       "ev-pki@graphdefined.com",
+            "www":         "https://www.graphdefined.com"
+        },
+        "signatures": [
+            {
+                "@id":   "7376ac8fc3daf3c2c8244f16fa6f8f3afb4e7a1588a9ea73ec1ce4d623db6e90",
+                "name":  "Open Charging Cloud PKI - FQ1",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "ANr6IaqRVZlJHs62MvsWWFoD+Srl/ylu45YGDslv6GwkJ07BJAPqrq/U1eHeiDf13aBDqcKbXE/h4HX5eAjQBjPf",
+                "s":     "PKCIYoy59OewaTNqHdA90qLX+1z1v9CILGxznGtWOKAkodFQ3+ircxVldCwyfp35ii03wO69vqmYCCFq3u2IIo0="
+            },
+            {
+                "@id":   "2e4e39c670b5a54ff03fe2fa99b8e32b33c3f583460bef17805f54fee3174325",
+                "name":  "Open Charging Cloud PKI - FQ2",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "ANKLYf01jxf0zBAwPV6FvTqzv2yhKAtg5OPJfzVCOUEu3FHEP5kCVgfBcfvQUsbxe3k836V7p2lKSEVo9D+aD2rP",
+                "s":     "S5gBncABlLsI5j1tpxA9qHVq01cwiIC3/zpFDC4GiMa21Ev0xsbmfF8epgBxMlUD3lq4BYaIh4sZ1j9qH68UHAM="
+            },
+            {
+                "@id":   "30e37fd90de1cc524cf4f4397d27b34d391420f61854df92d850eb7956970078",
+                "name":  "Open Charging Cloud PKI - FQ3",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "AUzcId9nsUm6vLPG1wAefserL3nrVhIKUtHa2NMPl/NdPUynEoobzEXIhlV3ESk4iX4HGHdCg4h9ekxCjTm6EF5H",
+                "s":     "ALbYuSofZrt0cidIDnNpGwv9qgTgs0TjcFxML7COd885QAFjjh0CK2JmeCFPWc6dfsOTxRTqwknQvrkkuVpaGTPS"
+            }
+        ]
+    },
+    {
+        "@id":         "4d4d175d7e8c6ee3ab998281ecaa2f39b94e9c336098e3f3fad792db75a04e82",
+        "@context":    "https://open.charging.cloud/context/pkiCertificate",
+        "description": "Open Charging Cloud - Fundamental Quorum 3",
+        "publicKeys": [
+            {
+                "x":         "AJdUbciamyDbtL4L9uWFtpdTLqrvd9/ZhhIXExZC/5pe6exnhTbEXR0UE0FC3zmSetl1+8U5q4N+CCxJfvk0ODy+",
+                "y":         "AUkIxEi+sIMb245tHJWx1SAlJjGk7KZhbZe2lbbGatBp1dtxyOFEs+xA/MPs/19I6edvLsdv/PyB3Y/u7tt2XItg",
+                "algorithm": "https://open.charging.cloud/context/certificates/algorithm/secp521r1",
+                "encoding":  "https://open.charging.cloud/context/certificates/encoding/base64"
+            }
+        ],
+        "usages": [
+            {
+                "@id": "https://open.charging.cloud/context/certificates/usages/signCertificates"
+            }
+        ],
+        "notBefore": "2023-01-01T00:00:00.000Z",
+        "notAfter":  "2028-01-01T00:00:00.000Z",
+        "owner": {
+            "name":        "GraphDefined GmbH",
+            "description": "GraphDefined E-Mobility Services",
+            "eMail":       "ev-pki@graphdefined.com",
+            "www":         "https://www.graphdefined.com"
+        },
+        "signatures": [
+            {
+                "@id":   "2aa8d9975d282ce8bd1470af78ed82cfb8f327d154af371f18a7f9bd7009f80f",
+                "name":  "Open Charging Cloud PKI - FQ1",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "AXQuyzVyCg9zM7U3FyfBu9kMdoi0a6vK0UQxt+wKRtDwGMyphJeV3jU0DL4WRl/xAZapvzB88n0P+MtwJpFiCJxu",
+                "s":     "AeNRkjiyRpIoarR9pZUtEcUH7NZitizPSAyAiwvr2jjxUdzYI6UfVkewcPDPaPRz7D8OYOLIYTfAB4unGMdPBNgq"
+            },
+            {
+                "@id":   "5d6f60300e179e4dce7ec77e9c32c7069de67220282fb7ddf17156e7b9517e6b",
+                "name":  "Open Charging Cloud PKI - FQ2",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "FskFuzu4NDEm4lvSstbO0MSBf6ITkVQ9VXtSJ644Suw2VIlk2oca+A52FtOP0MDld2egtKTG2d+1zbrbkiHp0m8=",
+                "s":     "P9v5wp6NqWwD5KzeWGj3XjAh8KxSbs3Ld8L50+mPHM0++PAw9WCV4KaNOk3+G/We8V1ulY9nZQ+dXlV+jkNd0wo="
+            },
+            {
+                "@id":   "d8488379602dd4f1d791bd629606921df31748dd263e8537fa8172b9b0297cf0",
+                "name":  "Open Charging Cloud PKI - FQ3",
+                "eMail": "pki@open.charging.cloud",
+                "r":     "XbJlKGKNx3L1Oz3usgWHHIEcHTkeOs/xhFeZ3xQ/rxyuPYSLyhmo71pgq5UsqD24Y1lxJg5ry3CHiE5rGunKwGw=",
+                "s":     "dizwnujZTRC+WlM1sz8sDi+SoiLKPPIh61/dFGM5hXxaaLUFNREejFuelVAQP5QI7WvpPWojY90ISSlZY4H/PrQ="
+            }
+        ]
+    }
+]
