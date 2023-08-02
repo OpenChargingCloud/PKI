@@ -31,7 +31,7 @@ limitations of the traditional X.509 model, embracing a graph-based representati
 digital communications in e-mobility.
 
 
-## Core Certificates
+## Fundamental Quorum
 
 The following three [secp521r1](https://neuromancer.sk/std/nist/P-521) public keys define the fundamental 2/3 quorum.    
 The encoding is base64.
@@ -42,6 +42,8 @@ Public Key B: BADk0FLDzC8745NqTw3A8jgSJJdRX9E7Cfj6vY4e8m1Sbc8qKoKfq5Jr4wjWfSIRAY
 Public Key C: BACXVG3Impsg27S+C/blhbaXUy6q73ff2YYSFxMWQv+aXunsZ4U2xF0dFBNBQt85knrZdfvFOauDfggsSX75NDg8vgFJCMRIvrCDG9uObRyVsdUgJSYxpOymYW2XtpW2xmrQadXbccjhRLPsQPzD7P9fSOnnby7Hb/z8gd2P7u7bdlyLYA==
 ```
 
+
+## Core Certificates
 
 ```
 Virtual PTB
