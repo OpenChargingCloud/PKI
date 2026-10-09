@@ -1,0 +1,25 @@
+{
+  // The same rules as the page, for the files Node runs rather than webpack:
+  // they import with the extension spelled out, which needs saying, and they
+  // are never emitted.
+  "extends": "./tsconfig.json",
+
+  "compilerOptions": {
+    "types":                      [ "node" ],
+    "noEmit":                     true,
+    "allowImportingTsExtensions": true,
+
+    // tsconfig.json's, and happy-dom besides, which WWCP_Node's test/dom.ts
+    // imports for a test that draws: this directory's, as test/resolve.ts
+    // finds it. paths are not merged with the ones extended, so all of them.
+    "paths": {
+      "@node/*":                        [ "../../../WWCP_Node/Frontend/src/*" ],
+      "lit-html":                       [ "./node_modules/lit-html" ],
+      "lit-html/*":                     [ "./node_modules/lit-html/*" ],
+      "@happy-dom/global-registrator":  [ "./node_modules/@happy-dom/global-registrator" ]
+    }
+  },
+
+  "include": [ "src/**/*.test.ts", "test/**/*.ts" ],
+  "exclude": []
+}

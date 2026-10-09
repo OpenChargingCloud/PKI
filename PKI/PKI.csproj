@@ -1,0 +1,123 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>cloud.charging.open.PKI</RootNamespace>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Hermod\Hermod\Hermod.csproj" />
+    <ProjectReference Include="..\..\Norn\Norn\Norn.csproj" />
+    <ProjectReference Include="..\..\Styx\Styx\Styx.csproj" />
+    <ProjectReference Include="..\..\Urdr\Urdr\Urdr.csproj" />
+    <ProjectReference Include="..\..\WWCP_Node\WWCP_Node\WWCP_Node.csproj" />
+  </ItemGroup>
+
+  <!--
+    The web interface
+    =================
+
+    The frontend lives in Frontend/ (npm + webpack) and is built into
+    Frontend/dist. This project runs that build and embeds dist/ as manifest
+    resources named "<RootNamespace>.HTTPRoot.<dir>.<file>", e.g.
+    "cloud.charging.open.PKI.HTTPRoot.assets.main.3f9c1a.js" - which is what
+    Hermod's EmbeddedContentSource reads and MapSinglePageApplication serves.
+
+      dotnet build                            builds the frontend when its inputs changed
+      dotnet build -p:SkipFrontendBuild=true  backend only, reusing whatever is in dist/ -
+                                             and, where nothing is, an assembly with no web
+                                             interface at all, which is a warning and not an error
+
+    Three separate targets on purpose:
+      - NpmInstall     runs "npm ci" when node_modules is missing or older than
+                       package.json or package-lock.json (Inputs/Outputs)
+      - BuildFrontend  runs "npm run build" incrementally (Inputs/Outputs)
+      - EmbedFrontend  adds the EmbeddedResource items; it must NOT carry
+                       Inputs/Outputs, because a target skipped as up-to-date
+                       does not evaluate its item groups.
+    Static globs in the project body would not work: they are evaluated before
+    any target runs, i.e. before dist/ exists on a clean build.
+  -->
+
+  <PropertyGroup Label="Frontend">
+    <FrontendDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', 'Frontend'))</FrontendDir>
+    <FrontendDist>$([MSBuild]::NormalizeDirectory('$(FrontendDir)', 'dist'))</FrontendDist>
+    <FrontendResourcePrefix>$(RootNamespace).HTTPRoot.</FrontendResourcePrefix>
+    <FrontendBuildEnabled Condition="'$(SkipFrontendBuild)' != 'true' And '$(DesignTimeBuild)' != 'true'">true</FrontendBuildEnabled>
+  </PropertyGroup>
+
+  <ItemGroup Label="Frontend">
+    <FrontendInput Include="$(FrontendDir)src\**\*" />
+    <FrontendInput Include="$(FrontendDir)package.json;$(FrontendDir)package-lock.json;$(FrontendDir)tsconfig.json;$(FrontendDir)webpack.config.js" />
+    <!-- What every kind of node shares, bundled in as "@node/...": without it
+         here, a new WWCP_Node changed only files the build did not look at,
+         the bundle was up to date, and the old one was embedded. -->
+    <FrontendInput Include="$(MSBuildProjectDirectory)\..\..\WWCP_Node\Frontend\src\**\*" />
+  </ItemGroup>
+
+  <!-- npm keeps a copy of the lock file it last installed by, in
+       node_modules/.package-lock.json. Missing, nothing is installed yet;
+       older than package.json or package-lock.json - a pull that brought a
+       dependency the frontend now imports, say - node_modules is no longer
+       what the lock file asks for, and webpack fails on what is not there.
+       It used to be installed only where node_modules was missing, so a
+       checkout that had built once never got the new dependency. "npm ci"
+       makes node_modules exactly what the lock file says, and the copy is
+       touched after, so that this is up to date until either file changes. -->
+  <Target Name="NpmInstall"
+          Inputs="$(FrontendDir)package.json;$(FrontendDir)package-lock.json"
+          Outputs="$(FrontendDir)node_modules\.package-lock.json"
+          Condition="'$(FrontendBuildEnabled)' == 'true'">
+    <Message Importance="high" Text="Frontend: installing npm dependencies in '$(FrontendDir)' as package-lock.json says ..." />
+    <Exec Command="npm ci" WorkingDirectory="$(FrontendDir)" />
+    <Touch Files="$(FrontendDir)node_modules\.package-lock.json" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="BuildFrontend"
+          DependsOnTargets="NpmInstall"
+          Inputs="@(FrontendInput)"
+          Outputs="$(FrontendDist)index.html"
+          Condition="'$(FrontendBuildEnabled)' == 'true'">
+    <Message Importance="high" Text="Frontend: running 'npm run build' in '$(FrontendDir)' ..." />
+    <Exec Command="npm run build" WorkingDirectory="$(FrontendDir)" />
+    <!-- webpack leaves a file alone whose content did not change, and so
+         index.html kept the time of the build before: older than the input
+         that had just been built, the target was never up to date again, and
+         every build ran npm. Touched, it says when it was last built. -->
+    <Touch Files="$(FrontendDist)index.html" />
+  </Target>
+
+  <Target Name="EmbedFrontend"
+          DependsOnTargets="BuildFrontend"
+          BeforeTargets="BeforeBuild"
+          Condition="'$(DesignTimeBuild)' != 'true'">
+
+    <!-- Built, and still not there: npm ran and produced nothing, which is a
+         build that failed rather than one without a web interface. -->
+    <Error Condition="'$(FrontendBuildEnabled)' == 'true' And !Exists('$(FrontendDist)index.html')"
+           Text="The frontend build in '$(FrontendDir)' produced no '$(FrontendDist)index.html'. Read what 'npm run build' said above." />
+
+    <!-- Asked to skip the frontend build, and there is nothing from an earlier
+         one to reuse. The assembly is then built without a web interface, which
+         it survives: the JSON API answers, a browser gets nothing, and it says
+         exactly that at every start. A warning rather than an error, because
+         "no Node on this machine" is a reason to build the backend alone, not
+         a reason to be unable to. -->
+    <Warning Condition="'$(FrontendBuildEnabled)' != 'true' And !Exists('$(FrontendDist)index.html')"
+             Text="No web interface: '$(FrontendDist)' holds no index.html and the frontend build was skipped. Run 'npm run build' in '$(FrontendDir)' and build again to get one." />
+
+    <ItemGroup Condition="Exists('$(FrontendDist)index.html')">
+      <_FrontendFile Include="$(FrontendDist)**\*" />
+      <EmbeddedResource Include="@(_FrontendFile)"
+                        LogicalName="$(FrontendResourcePrefix)$([System.String]::Copy('%(_FrontendFile.RecursiveDir)').Replace('\', '.').Replace('/', '.'))%(_FrontendFile.Filename)%(_FrontendFile.Extension)"
+                        WithCulture="false" />
+    </ItemGroup>
+
+    <Message Importance="high" Condition="Exists('$(FrontendDist)index.html')" Text="Frontend: embedding @(_FrontendFile->Count()) files from '$(FrontendDist)' as '$(FrontendResourcePrefix)*'." />
+
+  </Target>
+
+</Project>

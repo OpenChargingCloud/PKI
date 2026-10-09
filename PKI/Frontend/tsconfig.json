@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [ "ES2022", "DOM", "DOM.Iterable" ],
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": true,
+
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "newLine": "lf",
+
+    // "@node/..." is what every kind of node shares, in the WWCP_Node next to
+    // this repository - where webpack.config.js's alias finds it too. lit-html,
+    // which the shared files draw with, is this directory's, as webpack's
+    // resolve.modules finds it.
+    "paths": {
+      "@node/*":     [ "../../../WWCP_Node/Frontend/src/*" ],
+      "lit-html":    [ "./node_modules/lit-html" ],
+      "lit-html/*":  [ "./node_modules/lit-html/*" ]
+    }
+  },
+
+  // The shared files are checked as this node's own: with these rules, as
+  // this node uses them.
+  "include": [ "src/**/*.ts", "../../../WWCP_Node/Frontend/src/**/*.ts" ],
+
+  // The tests are read by Node rather than by webpack, and spell their imports
+  // the way Node wants them - with the extension - which ts-loader's own
+  // settings may not allow. They are checked by tsconfig.test.json instead;
+  // the shared files' tests are WWCP_Node's to run.
+  "exclude": [ "src/**/*.test.ts", "../../../WWCP_Node/Frontend/src/**/*.test.ts" ]
+}
