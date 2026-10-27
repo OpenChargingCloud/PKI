@@ -111,7 +111,8 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// The kinds of certificate the node's own store keeps: the four of
-        /// TLS, and none of the seven of ISO 15118, which are a vehicle's.
+        /// TLS, the identity its web interface shows over HTTPS, and none of
+        /// the seven of ISO 15118, which are a vehicle's.
         /// </summary>
         /// <remarks>
         /// The roots a time server or a name server of this PKI may chain to
@@ -119,8 +120,14 @@ namespace cloud.charging.open.PKI
         /// present, kept to hold them to by their fingerprints. Not the
         /// certificates the PKI makes: those are in a store of their own, see
         /// <see cref="Store"/>.
+        ///
+        /// The TLS server identity is what the web interface, the JSON API and
+        /// the sign-in show where the "web" section says "tls": { "certificate":
+        /// "store" }, or --https - kept from the start, so that
+        /// --import-certificate tlsServerIdentity=&lt;file&gt; puts it in at the
+        /// same start that asks for it.
         /// </remarks>
-        public static readonly      IReadOnlyList<CertificateKind>  CertificateKinds  = CertificateKindExtensions.TLS;
+        public static readonly      IReadOnlyList<CertificateKind>  CertificateKinds  = [ .. CertificateKindExtensions.TLS, CertificateKind.TLSServerIdentity ];
 
         #endregion
 
@@ -163,6 +170,7 @@ namespace cloud.charging.open.PKI
         /// <param name="BridgeDebugLog">Whether what the libraries below write with DebugX is picked up.</param>
         /// <param name="TimeProvider">The clock, or null for the system one.</param>
         /// <param name="SSH">What the program says about serving the command line over SSH; nothing by default - see SSHSettings.</param>
+        /// <param name="Web">What the program says of HTTPS and of the reverse proxies in front - --https, --https-cert, --redirect-port and --trusted-proxy - over the "web" section of the configuration file; nothing by default, and then the file alone says it.</param>
         public PKI(IIPAddress?            HTTPHostname       = null,
                    IPPort?                HTTPPort           = null,
                    HTTPServer?            HTTPServer         = null,
@@ -182,7 +190,8 @@ namespace cloud.charging.open.PKI
                    String?                LogPath            = null,
                    Boolean                BridgeDebugLog     = true,
                    TimeProvider?          TimeProvider       = null,
-                   SSHSettings?           SSH                = null)
+                   SSHSettings?           SSH                = null,
+                   WebConfiguration?      Web                = null)
 
             : base(Kind:               PKIKind,
                    Version:            typeof(PKI).Assembly.GetName().Version?.ToString(3) ?? "0.0.0",
@@ -207,7 +216,13 @@ namespace cloud.charging.open.PKI
                    LogPath:            LogPath,
                    BridgeDebugLog:     BridgeDebugLog,
                    TimeProvider:       TimeProvider,
-                   SSH:                SSH)
+                   SSH:                SSH,
+
+                   // HTTPS of the PKI's own, or the proxies in front believed:
+                   // with --any the sign-in and the private keys it hands out
+                   // would otherwise cross the network in the clear - see the
+                   // node's "web" section.
+                   Web:                Web)
 
         {
 
