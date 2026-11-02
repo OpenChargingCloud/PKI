@@ -20,13 +20,13 @@
     "happy-dom": "^21.0.4",
     "html-webpack-plugin": "^5.6.8",
     "mini-css-extract-plugin": "^2.10.2",
-    "sass": "^1.107.0",
+    "sass": "^1.107.1",
     "sass-loader": "^17.1.0",
     "terser-webpack-plugin": "^5.6.1",
     "ts-loader": "^9.6.2",
     "typescript": "^6.0.3",
     "webpack": "^5.112.2",
-    "webpack-cli": "^7.2.3"
+    "webpack-cli": "^7.3.1"
   },
   "dependencies": {
     "@fortawesome/fontawesome-free": "^7.3.1",
