@@ -46,9 +46,10 @@ export interface Configuration extends NodeConfiguration {
 /**
  * What a certificate in the node's own store is for: the four kinds of TLS,
  * which are what the PKI believes and shows as a node - its time servers'
- * roots, say. Not the certificates it makes: those are below.
+ * roots, say - and the identity its web interface shows over HTTPS. Not the
+ * certificates it makes: those are below.
  */
-export type CertificateKind = 'tlsRoot' | 'clientRoot' | 'tlsServer' | 'tlsIdentity';
+export type CertificateKind = 'tlsRoot' | 'clientRoot' | 'tlsServer' | 'tlsIdentity' | 'tlsServerIdentity';
 
 /** One certificate in the node's own store. */
 export type Certificate = NodeCertificate<CertificateKind>;
@@ -85,6 +86,8 @@ export interface PKICertificate {
     pathLength:               number | null;
     /** Whether this PKI made its key, and has it. */
     hasPrivateKey:            boolean;
+    /** Whether that key has a password - which the PKI keeps nowhere. */
+    keyEncrypted:             boolean;
     fromCSR:                  boolean;
     createdAt:                string;
     createdBy:                string | null;
@@ -110,8 +113,10 @@ export interface PKICertificates {
     certificates:     PKICertificate[];
     total:            number;
     directory:        string;
-    keyAlgorithms:    string[];
-    maxValidityDays:  number;
+    keyAlgorithms:         string[];
+    maxValidityDays:       number;
+    /** The shortest password a key may be given; none at all is fine too. */
+    minKeyPasswordLength:  number;
 }
 
 /** Who a certificate is about: the common name, and what is around it where it is given. */
@@ -124,22 +129,29 @@ export interface SubjectName {
     locality?:            string;
 }
 
-/** A new root CA. A number left empty is sent as null - not said - and the PKI takes its own. */
+/**
+ * A new root CA. A number left empty is sent as null - not said - and the PKI
+ * takes its own; a password left empty, as none: the key is kept unencrypted.
+ */
 export interface NewRootCA {
     subject:       SubjectName;
     keyAlgorithm:  string;
     validDays:     number;
     pathLength:    number | null;
+    keyPassword:   string | null;
 }
 
-/** A new sub-CA, below a CA of this PKI. */
+/** A new sub-CA, below a CA of this PKI - with the password of that CA's key, where it has one. */
 export interface NewSubCA extends NewRootCA {
-    issuer:  string;
+    issuer:             string;
+    issuerKeyPassword:  string | null;
 }
 
 /** A new certificate for a server or a client, with a key made by the PKI. */
 export interface NewCertificate {
     issuer:                   string;
+    issuerKeyPassword:        string | null;
+    keyPassword:              string | null;
     profile:                  'server' | 'client';
     subject:                  SubjectName;
     keyAlgorithm:             string;
@@ -150,6 +162,7 @@ export interface NewCertificate {
 /** A certificate for the key of a CSR. */
 export interface CSRSigning {
     issuer:                       string;
+    issuerKeyPassword:            string | null;
     profile:                      'subCA' | 'server' | 'client';
     csr:                          string;
     validDays:                    number;
@@ -185,7 +198,9 @@ export const api = {
     pki: {
         list:        ()                                => request<PKICertificates>       ('GET',    '/pki/certificates'),
         get:         (id: string)                      => request<PKICertificateDetails> ('GET',    pki(id)),
-        privateKey:  (id: string)                      => request<{ id: string; privateKey: string }>('GET', `${pki(id)}/key`),
+        privateKey:  (id: string)                      => request<{ id: string; privateKey: string; encrypted: boolean }>('GET', `${pki(id)}/key`),
+        keyPassword: (id: string, password: string | null, newPassword: string | null) =>
+                                                          request<PKICertificateDetails> ('POST',   `${pki(id)}/key/password`, { password, newPassword }),
         remove:      (id: string, withIssued: boolean) => request<PKIDeleted>            ('DELETE', `${pki(id)}${withIssued ? '?withIssued=true' : ''}`),
         rootCA:      (ca: NewRootCA)                   => request<PKICertificateDetails> ('POST',   '/pki/rootCAs',      ca),
         subCA:       (ca: NewSubCA)                    => request<PKICertificateDetails> ('POST',   '/pki/subCAs',       ca),

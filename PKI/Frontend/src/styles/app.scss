@@ -90,6 +90,30 @@ table.records.pki-list {
 
 }
 
+// A password for a key and the same again: side by side where there is room,
+// as the subject's fields are.
+.key-password-fields {
+
+    display:                grid;
+    grid-template-columns:  repeat(auto-fill, minmax(14rem, 1fr));
+    gap:                    0.85rem;
+
+}
+
+// The password of a key, below its PEM in the details: set apart from the
+// certificate above, which goes out, by what never does.
+.pki-details .key-password {
+
+    border-top:   1px solid $color-border;
+    margin-top:   1rem;
+    padding-top:  0.75rem;
+
+    h3 {
+        margin:  0;
+    }
+
+}
+
 // What a CSR says, before it is signed.
 .csr-preview {
     border-left:   3px solid $color-accent;

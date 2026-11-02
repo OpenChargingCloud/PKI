@@ -72,10 +72,15 @@ namespace cloud.charging.open.PKI.Issuance
     /// here: its key never left whoever asked.
     /// </para>
     /// <para>
-    /// The private keys are kept <b>unencrypted</b>, as the node's own store
-    /// keeps its own: the file system is what guards them, and on Linux and
-    /// macOS they are written readable by their owner alone. Whoever can read
-    /// this directory can sign as every CA in it.
+    /// A private key is kept unencrypted unless it was given a password: then
+    /// it is an "ENCRYPTED PRIVATE KEY", PKCS#8 encrypted with AES-256 and a
+    /// key derived from the password by PBKDF2 - see <see cref="KeyEncryption"/>.
+    /// The password itself is kept nowhere: a CA whose key has one signs only
+    /// when it is given again, and the key of a server or a client goes out
+    /// as it is kept, for whoever has it to open with the password. Either
+    /// way, the file system guards the keys too: on Linux and macOS they are
+    /// written readable by their owner alone. Whoever can read this directory
+    /// can sign as every CA in it whose key has no password.
     /// </para>
     /// <para>
     /// Everything that changes the store does so under one lock, and writes
@@ -108,6 +113,22 @@ namespace cloud.charging.open.PKI.Issuance
         /// life.
         /// </summary>
         public static readonly TimeSpan  ClockSkew  = TimeSpan.FromMinutes(5);
+
+        /// <summary>
+        /// The shortest password a private key may be given: a password is
+        /// optional, but one of three letters protects nothing.
+        /// </summary>
+        public const   Int32   MinKeyPasswordLength  = 8;
+
+        /// <summary>
+        /// How a private key with a password is encrypted: PKCS#8 with
+        /// AES-256-CBC, its key derived from the password by PBKDF2 with
+        /// SHA-256 and 600,000 iterations - what OWASP asks of PBKDF2 with
+        /// SHA-256 - so that openssl and every TLS stack can open it.
+        /// </summary>
+        public static readonly PbeParameters  KeyEncryption  = new (PbeEncryptionAlgorithm.Aes256Cbc, HashAlgorithmName.SHA256, 600_000);
+
+        private const  String  EncryptedKeyLabel     = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
 
         private readonly  Object                                 gate          = new();
         private readonly  Dictionary<String, IssuedCertificate>  certificates  = new (StringComparer.OrdinalIgnoreCase);
@@ -211,7 +232,12 @@ namespace cloud.charging.open.PKI.Issuance
 
                     // The key is what is on the disk, not what the index says:
                     // a key somebody moved away is a CA that can sign no more.
-                    certificates[certificate.Id] = certificate with { HasPrivateKey = File.Exists(KeyFile(certificate.Id)) };
+                    var keyFile = KeyFile(certificate.Id);
+
+                    certificates[certificate.Id] = certificate with {
+                                                       HasPrivateKey  = File.Exists(keyFile),
+                                                       KeyEncrypted   = File.Exists(keyFile) && IsEncrypted(File.ReadAllText(keyFile))
+                                                   };
 
                 }
 
@@ -343,7 +369,8 @@ namespace cloud.charging.open.PKI.Issuance
         }
 
         /// <summary>
-        /// The private key as PKCS#8 PEM, unencrypted - or null where this PKI
+        /// The private key as PKCS#8 PEM, as it is kept: encrypted where it
+        /// was given a password, unencrypted where not - or null where this PKI
         /// does not have it.
         /// </summary>
         public String? PrivateKeyPEM(String Id)
@@ -383,11 +410,13 @@ namespace cloud.charging.open.PKI.Issuance
         /// <param name="KeyAlgorithm">What kind of key it is made with.</param>
         /// <param name="ValidDays">For how many days from now it holds.</param>
         /// <param name="PathLength">How many sub-CAs may stand below it, one below the other; null for any number.</param>
+        /// <param name="KeyPassword">The password its key is encrypted with; null to keep it unencrypted.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
         public Boolean TryCreateRootCA(SubjectName                                   Subject,
                                        KeyAlgorithm                                  KeyAlgorithm,
                                        Int32                                         ValidDays,
                                        Int32?                                        PathLength,
+                                       String?                                       KeyPassword,
                                        String?                                       CreatedBy,
                                        [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                        [NotNullWhen(false)] out String?              Error,
@@ -398,7 +427,8 @@ namespace cloud.charging.open.PKI.Issuance
             NotSaved     = false;
 
             if (!ValidityIsFine(ValidDays, out Error) ||
-                !PathLengthIsFine(PathLength, out Error))
+                !PathLengthIsFine(PathLength, out Error) ||
+                !KeyPasswordIsFine(KeyPassword, out Error))
             {
                 return false;
             }
@@ -418,7 +448,7 @@ namespace cloud.charging.open.PKI.Issuance
                                         NewSerialNumber()
                                     );
 
-            return TryKeep(certificate, key, CertificateProfile.RootCA, null, PathLength, false, CreatedBy, out Certificate, out Error, out NotSaved);
+            return TryKeep(certificate, key, KeyPassword, CertificateProfile.RootCA, null, PathLength, false, CreatedBy, out Certificate, out Error, out NotSaved);
 
         }
 
@@ -431,20 +461,24 @@ namespace cloud.charging.open.PKI.Issuance
         /// sub-CA, or a certificate for a server or a client.
         /// </summary>
         /// <param name="IssuerId">The CA that signs it.</param>
+        /// <param name="IssuerKeyPassword">The password of the CA's key, where it has one.</param>
         /// <param name="Profile">A sub-CA, a server or a client.</param>
         /// <param name="Subject">Who it is about.</param>
         /// <param name="KeyAlgorithm">What kind of key it is made with.</param>
         /// <param name="ValidDays">For how many days from now it holds; no longer than its CA.</param>
         /// <param name="AlternativeNames">The other names it is valid for - a server's host names and addresses.</param>
         /// <param name="PathLength">For a sub-CA: how many sub-CAs may stand below it; null for as many as its CA allows.</param>
+        /// <param name="KeyPassword">The password its new key is encrypted with; null to keep it unencrypted.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
         public Boolean TryIssue(String                                        IssuerId,
+                                String?                                       IssuerKeyPassword,
                                 CertificateProfile                            Profile,
                                 SubjectName                                   Subject,
                                 KeyAlgorithm                                  KeyAlgorithm,
                                 Int32                                         ValidDays,
                                 IReadOnlyList<String>                         AlternativeNames,
                                 Int32?                                        PathLength,
+                                String?                                       KeyPassword,
                                 String?                                       CreatedBy,
                                 [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                 [NotNullWhen(false)] out String?              Error,
@@ -460,9 +494,12 @@ namespace cloud.charging.open.PKI.Issuance
                 return false;
             }
 
+            if (!KeyPasswordIsFine(KeyPassword, out Error))
+                return false;
+
             using var key = KeyAlgorithm.NewKey();
 
-            return TrySign(IssuerId, Profile, Subject.ToX500(), Subject.CommonName, new PublicKey(key), key,
+            return TrySign(IssuerId, IssuerKeyPassword, Profile, Subject.ToX500(), Subject.CommonName, new PublicKey(key), key, KeyPassword,
                            ValidDays, WithHostName(Profile, Subject.CommonName, AlternativeNames), PathLength, false, CreatedBy,
                            out Certificate, out Error, out NotSaved);
 
@@ -486,6 +523,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// is the difference between a PKI and a signing oracle.
         /// </remarks>
         /// <param name="IssuerId">The CA that signs it.</param>
+        /// <param name="IssuerKeyPassword">The password of the CA's key, where it has one.</param>
         /// <param name="Profile">A sub-CA, a server or a client.</param>
         /// <param name="CSR">The request, as PEM - or as Base64 of its DER.</param>
         /// <param name="ValidDays">For how many days from now it holds; no longer than its CA.</param>
@@ -494,6 +532,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// <param name="PathLength">For a sub-CA: how many sub-CAs may stand below it.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
         public Boolean TryIssueFromCSR(String                                        IssuerId,
+                                       String?                                       IssuerKeyPassword,
                                        CertificateProfile                            Profile,
                                        String                                        CSR,
                                        Int32                                         ValidDays,
@@ -551,7 +590,7 @@ namespace cloud.charging.open.PKI.Issuance
                 }
             }
 
-            return TrySign(IssuerId, Profile, request.SubjectName, commonName, request.PublicKey, null,
+            return TrySign(IssuerId, IssuerKeyPassword, Profile, request.SubjectName, commonName, request.PublicKey, null, null,
                            ValidDays, WithHostName(Profile, commonName, names), PathLength, true, CreatedBy,
                            out Certificate, out Error, out NotSaved);
 
@@ -714,6 +753,107 @@ namespace cloud.charging.open.PKI.Issuance
 
         #endregion
 
+        #region TryChangeKeyPassword(Id, Password, NewPassword, out Certificate, out Error, out NotFound, out NotSaved)
+
+        /// <summary>
+        /// Give the private key of a certificate a password, another one, or
+        /// none any more: the key is opened with the password it has - none,
+        /// where it has none - and kept anew, encrypted with the new one, or
+        /// unencrypted where that is null.
+        /// </summary>
+        /// <remarks>
+        /// The key file is replaced through a temporary file moved into place,
+        /// so that a process dying mid-write leaves the old key behind and not
+        /// half of the new one. Whether a key is encrypted is read from its
+        /// file at every start, so an index that cannot be written afterwards
+        /// is said again correctly then.
+        /// </remarks>
+        /// <param name="Id">The certificate whose key it is.</param>
+        /// <param name="Password">The password the key has now; null where it has none.</param>
+        /// <param name="NewPassword">The password it is to have; null for none.</param>
+        public Boolean TryChangeKeyPassword(String                                        Id,
+                                            String?                                       Password,
+                                            String?                                       NewPassword,
+                                            [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
+                                            [NotNullWhen(false)] out String?              Error,
+                                            out Boolean                                   NotFound,
+                                            out Boolean                                   NotSaved)
+        {
+
+            Certificate  = null;
+            NotFound     = false;
+            NotSaved     = false;
+
+            if (!KeyPasswordIsFine(NewPassword, out Error))
+                return false;
+
+            lock (gate)
+            {
+
+                var certificate = Get(Id);
+
+                if (certificate is null)
+                {
+                    NotFound = true;
+                    Error    = $"There is no certificate '{Id}' in this PKI.";
+                    return false;
+                }
+
+                var keyPEM = PrivateKeyPEM(certificate.Id);
+
+                if (keyPEM is null)
+                {
+                    NotFound = true;
+                    Error    = certificate.FromCSR
+                                   ? $"'{certificate.CommonName}' was signed for a CSR: its private key never was here."
+                                   : $"The private key of '{certificate.CommonName}' is not in this PKI any more.";
+                    return false;
+                }
+
+                using var x509 = Load(certificate.Id)!;
+
+                if (!TryLoadKey(keyPEM, x509.PublicKey, Password, out var key, out var keyError))
+                {
+                    Error = $"The password of the private key of the {certificate.Profile.InWords()} '{certificate.CommonName}' was not changed: {keyError}";
+                    return false;
+                }
+
+                var keyFile    = KeyFile(certificate.Id);
+                var temporary  = keyFile + ".tmp";
+
+                using (key)
+                {
+                    try
+                    {
+                        TryDelete(temporary);
+                        WritePrivately(temporary, KeyPEM(key, NewPassword));
+                        File.Move(temporary, keyFile, overwrite: true);
+                    }
+                    catch (Exception e)
+                    {
+                        TryDelete(temporary);
+                        NotSaved = true;
+                        Error    = $"The private key could not be written to '{Directory}', and was left as it was: {e.Message}";
+                        return false;
+                    }
+                }
+
+                var changed = certificate with { KeyEncrypted = NewPassword is not null };
+
+                certificates[certificate.Id] = changed;
+
+                // The key file is what counts, and what the next start reads.
+                TryWriteIndex(out _);
+
+                Certificate = changed;
+                return true;
+
+            }
+
+        }
+
+        #endregion
+
 
         #region (private) TrySign(...)
 
@@ -722,11 +862,13 @@ namespace cloud.charging.open.PKI.Issuance
         /// and keep what came out.
         /// </summary>
         private Boolean TrySign(String                                        IssuerId,
+                                String?                                       IssuerKeyPassword,
                                 CertificateProfile                            Profile,
                                 X500DistinguishedName                         Subject,
                                 String                                        CommonName,
                                 PublicKey                                     PublicKey,
                                 AsymmetricAlgorithm?                          PrivateKey,
+                                String?                                       KeyPassword,
                                 Int32                                         ValidDays,
                                 IReadOnlyList<String>                         AlternativeNames,
                                 Int32?                                        PathLength,
@@ -815,7 +957,14 @@ namespace cloud.charging.open.PKI.Issuance
             #endregion
 
             using var issuerCertificate  = Load(issuer.Id)!;
-            using var issuerKey          = LoadKey(keyPEM, issuerCertificate.PublicKey);
+
+            if (!TryLoadKey(keyPEM, issuerCertificate.PublicKey, IssuerKeyPassword, out var loadedKey, out var keyError))
+            {
+                Error = $"The {issuer.Profile.InWords()} '{issuer.CommonName}' signs nothing: {keyError}";
+                return false;
+            }
+
+            using var issuerKey          = loadedKey;
 
             var hash     = KeyAlgorithm.Of(issuerCertificate.PublicKey)?.Hash ?? HashAlgorithmName.SHA256;
             var request  = NewRequest(Subject, PublicKey, hash);
@@ -830,7 +979,7 @@ namespace cloud.charging.open.PKI.Issuance
                                         NewSerialNumber()
                                     );
 
-            return TryKeep(certificate, PrivateKey, Profile, issuer.Id, PathLength, FromCSR, CreatedBy, out Certificate, out Error, out NotSaved);
+            return TryKeep(certificate, PrivateKey, KeyPassword, Profile, issuer.Id, PathLength, FromCSR, CreatedBy, out Certificate, out Error, out NotSaved);
 
         }
 
@@ -844,6 +993,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// </summary>
         private Boolean TryKeep(X509Certificate2                              Certificate,
                                 AsymmetricAlgorithm?                          PrivateKey,
+                                String?                                       KeyPassword,
                                 CertificateProfile                            Profile,
                                 String?                                       IssuerId,
                                 Int32?                                        PathLength,
@@ -874,6 +1024,7 @@ namespace cloud.charging.open.PKI.Issuance
                             SubjectAlternativeNames:  AlternativeNames.Of(Certificate),
                             PathLength:               PathLength,
                             HasPrivateKey:            PrivateKey is not null,
+                            KeyEncrypted:             PrivateKey is not null && KeyPassword is not null,
                             FromCSR:                  FromCSR,
                             CreatedAt:                timeProvider.GetUtcNow(),
                             CreatedBy:                CreatedBy
@@ -903,7 +1054,7 @@ namespace cloud.charging.open.PKI.Issuance
 
                     if (PrivateKey is not null)
                     {
-                        WritePrivately(KeyFile(id), PrivateKey.ExportPkcs8PrivateKeyPem() + "\n");
+                        WritePrivately(KeyFile(id), KeyPEM(PrivateKey, KeyPassword));
                         written.Add(KeyFile(id));
                     }
 
@@ -1065,25 +1216,82 @@ namespace cloud.charging.open.PKI.Issuance
                };
 
         /// <summary>
-        /// A private key from its PEM, of the kind the public key beside it is.
+        /// A private key from its PEM, of the kind the public key beside it is
+        /// - opened with the password where it is encrypted, and said why not
+        /// where there is none or it is not the one.
         /// </summary>
-        private static AsymmetricAlgorithm LoadKey(String     PEM,
-                                                   PublicKey  PublicKey)
+        private static Boolean TryLoadKey(String                                           PEM,
+                                          PublicKey                                        PublicKey,
+                                          String?                                          Password,
+                                          [NotNullWhen(true)]  out AsymmetricAlgorithm?    Key,
+                                          [NotNullWhen(false)] out String?                 Error)
         {
+
+            Key    = null;
+            Error  = null;
+
+            var encrypted = IsEncrypted(PEM);
+
+            if (encrypted && String.IsNullOrEmpty(Password))
+            {
+                Error = "its private key has a password, and none was given.";
+                return false;
+            }
+
+            AsymmetricAlgorithm key;
 
             if (PublicKey.GetECDsaPublicKey() is ECDsa ecdsaPublic)
             {
                 ecdsaPublic.Dispose();
-                var ecdsa = ECDsa.Create();
-                ecdsa.ImportFromPem(PEM);
-                return ecdsa;
+                key = ECDsa.Create();
+            }
+            else
+                key = RSA.Create();
+
+            try
+            {
+
+                if (encrypted)
+                    key.ImportFromEncryptedPem(PEM, Password);
+                else
+                    key.ImportFromPem(PEM);
+
+                Key = key;
+                return true;
+
+            }
+            catch (CryptographicException)
+            {
+
+                key.Dispose();
+
+                Error = encrypted
+                            ? "the password given is not the one of its private key."
+                            : "its private key could not be read.";
+
+                return false;
+
             }
 
-            var rsa = RSA.Create();
-            rsa.ImportFromPem(PEM);
-            return rsa;
-
         }
+
+        /// <summary>
+        /// A private key as PKCS#8 PEM: encrypted with the password, where
+        /// there is one - see <see cref="KeyEncryption"/>.
+        /// </summary>
+        private static String KeyPEM(AsymmetricAlgorithm  Key,
+                                     String?              Password)
+
+            => (Password is null
+                    ? Key.ExportPkcs8PrivateKeyPem()
+                    : Key.ExportEncryptedPkcs8PrivateKeyPem(Password, KeyEncryption)) + "\n";
+
+        /// <summary>
+        /// Whether a private key's PEM is encrypted.
+        /// </summary>
+        private static Boolean IsEncrypted(String PEM)
+
+            => PEM.Contains(EncryptedKeyLabel, StringComparison.Ordinal);
 
         /// <summary>
         /// Sixteen random bytes, positive: what RFC 5280 asks of a serial
@@ -1192,6 +1400,21 @@ namespace cloud.charging.open.PKI.Issuance
 
             Error = ValidDays < 1 || ValidDays > MaxValidityDays
                         ? $"A certificate holds for 1 to {MaxValidityDays} days; {ValidDays} is not among them."
+                        : null;
+
+            return Error is null;
+
+        }
+
+        /// <summary>
+        /// A password for a private key: none at all, or one of
+        /// <see cref="MinKeyPasswordLength"/> characters at least.
+        /// </summary>
+        private static Boolean KeyPasswordIsFine(String? Password, [NotNullWhen(false)] out String? Error)
+        {
+
+            Error = Password is not null && Password.Length < MinKeyPasswordLength
+                        ? $"A password for a private key has {MinKeyPasswordLength} characters at least, or there is none."
                         : null;
 
             return Error is null;

@@ -2,7 +2,9 @@
  * The PKI page drawn, in a document of happy-dom, against a stand-in PKI:
  * the list and its filter by the common name, the details of a certificate
  * opened from its row, a root CA made from its form and opened in the list,
- * and the forms left out for an account that may sign nothing.
+ * and the forms left out for an account that may sign nothing - and the
+ * passwords of keys: optional where a key is made, asked for where the CA
+ * chosen to sign has one, and given, changed or taken away in the details.
  */
 
 import { asked, field, open, submit, until, type Asked } from '../../test/pki.ts';
@@ -15,11 +17,18 @@ const { pkiPage } = await import('./pki.ts');
 
 const everything = [ 'authorities:read', 'authorities:edit', 'issuance:read', 'issuance:edit' ];
 
-function certificate(id: string, commonName: string, profile: string, issuerId: string | null): Record<string, unknown> {
+function certificate(id: string, commonName: string, profile: string, issuerId: string | null, keyEncrypted = false): Record<string, unknown> {
     return { id, profile, commonName, subject: `CN=${commonName}`, issuer: 'CN=Root', issuerId, serialNumber: '01',
              notBefore: '2026-01-01T00:00:00Z', notAfter: '2036-01-01T00:00:00Z', keyAlgorithm: 'ecc-p384',
-             subjectAlternativeNames: [], pathLength: null, hasPrivateKey: true, fromCSR: false,
+             subjectAlternativeNames: [], pathLength: null, hasPrivateKey: true, keyEncrypted, fromCSR: false,
              createdAt: '2026-01-01T00:00:00Z', createdBy: 'alice', status: 'valid' };
+}
+
+/** What the details of a certificate add to what its list says. */
+function detailed(found: Record<string, unknown>): Record<string, unknown> {
+    return { ...found, pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', chainPem: '',
+             chain: [ { id: found['id'], commonName: found['commonName'], profile: found['profile'] } ],
+             issuedCount: 0, belowCount: 0, mayDownloadPrivateKey: false };
 }
 
 let certificates: Record<string, unknown>[] = [];
@@ -27,18 +36,28 @@ let certificates: Record<string, unknown>[] = [];
 function pki({ method, path, body }: Asked): unknown {
 
     if (method === 'GET' && path === '/pki/certificates')
-        return { certificates, total: certificates.length, directory: '/srv/pki', maxValidityDays: 36500,
+        return { certificates, total: certificates.length, directory: '/srv/pki', maxValidityDays: 36500, minKeyPasswordLength: 8,
                  keyAlgorithms: [ 'ecc-p256', 'ecc-p384', 'ecc-p521', 'rsa-2048', 'rsa-3072', 'rsa-4096' ] };
 
     const one = /^\/pki\/certificates\/([0-9a-f]+)$/.exec(path);
 
     if (method === 'GET' && one !== null) {
         const found = certificates.find(certificate => certificate['id'] === one[1]);
-        return found === undefined
-                   ? undefined
-                   : { ...found, pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', chainPem: '',
-                       chain: [ { id: found['id'], commonName: found['commonName'], profile: found['profile'] } ],
-                       issuedCount: 0, belowCount: 0, mayDownloadPrivateKey: false };
+        return found === undefined ? undefined : detailed(found);
+    }
+
+    const password = /^\/pki\/certificates\/([0-9a-f]+)\/key\/password$/.exec(path);
+
+    if (method === 'POST' && password !== null) {
+        const found = certificates.find(certificate => certificate['id'] === password[1])!;
+        found['keyEncrypted'] = (body as { newPassword: string | null }).newPassword !== null;
+        return detailed(found);
+    }
+
+    if (method === 'POST' && path === '/pki/certificates') {
+        const made = certificate('dd', (body as { subject: { commonName: string } }).subject.commonName, 'client', 'aa');
+        certificates = [ made, ...certificates ];
+        return detailed(made);
     }
 
     if (method === 'POST' && path === '/pki/rootCAs') {
@@ -115,6 +134,115 @@ describe('the PKI page', () => {
 
         assert.ok(root.querySelector('tr[data-id="cc"]'), 'the new root CA is not in the list');
         assert.equal(root.querySelector('#panel-certificates')!.hasAttribute('hidden'), false, 'the list is not shown');
+
+    });
+
+    it('gives a new root CA the password typed twice, and sends nothing where the two differ', async () => {
+
+        certificates = [];
+
+        const root = await open(pkiPage, '/pki?tab=root-ca', everything, pki, root => root.querySelector('#root-ca-form') !== null);
+
+        field(root, '#root-ca-form', 'commonName').value        = 'Locked Root';
+        field(root, '#root-ca-form', 'newPassword').value       = 'correct horse battery staple';
+        field(root, '#root-ca-form', 'newPasswordAgain').value  = 'correct horse battery stable';
+
+        submit(root, '#root-ca-form');
+
+        await until(() => root.querySelector('#root-ca-error')!.textContent !== '', 'the two passwords were not compared');
+
+        assert.match(root.querySelector('#root-ca-error')!.textContent!, /not the same/);
+        assert.equal(asked.some(one => one.method === 'POST' && one.path === '/pki/rootCAs'), false, 'sent with two passwords that differ');
+
+        field(root, '#root-ca-form', 'newPasswordAgain').value  = 'correct horse battery staple';
+
+        submit(root, '#root-ca-form');
+
+        await until(() => root.querySelector('#pki-made') !== null, 'nothing said the root CA was made');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/rootCAs')!.body as Record<string, unknown>;
+
+        assert.equal(sent['keyPassword'], 'correct horse battery staple');
+        assert.equal('newPasswordAgain' in sent, false);
+
+    });
+
+    it('sends a key made without a password as having none', async () => {
+
+        certificates = [];
+
+        const root = await open(pkiPage, '/pki?tab=root-ca', everything, pki, root => root.querySelector('#root-ca-form') !== null);
+
+        field(root, '#root-ca-form', 'commonName').value = 'Open Root';
+
+        submit(root, '#root-ca-form');
+
+        await until(() => root.querySelector('#pki-made') !== null, 'nothing said the root CA was made');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/rootCAs')!.body as Record<string, unknown>;
+
+        assert.equal(sent['keyPassword'], null);
+
+    });
+
+    it('asks for the password of a CA only where the CA chosen to sign has one', async () => {
+
+        certificates = [ certificate('aa', 'Open Root',   'rootCA', null),
+                         certificate('ab', 'Locked Root', 'rootCA', null, true) ];
+
+        const root = await open(pkiPage, '/pki?tab=issue', everything, pki, root => root.querySelector('#issue-form') !== null);
+
+        const passwordOf = () => root.querySelector<HTMLLabelElement>('#issue-form .issuer-key-password')!;
+
+        assert.equal(passwordOf().hidden, true, 'asked for the password of a CA whose key has none');
+        assert.equal(field(root, '#issue-form', 'issuerKeyPassword').disabled, true);
+
+        const issuer = root.querySelector<HTMLSelectElement>('#issue-form select[name="issuer"]')!;
+        issuer.value = 'ab';
+        issuer.dispatchEvent(new Event('change', { bubbles: true }));
+
+        await until(() => !passwordOf().hidden, 'the password of the CA chosen was not asked for');
+
+        field(root, '#issue-form', 'commonName').value         = 'CS-0001';
+        field(root, '#issue-form', 'issuerKeyPassword').value  = 'correct horse battery staple';
+
+        submit(root, '#issue-form');
+
+        await until(() => root.querySelector('#pki-made') !== null, 'nothing said the certificate was made');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/certificates')!.body as Record<string, unknown>;
+
+        assert.equal(sent['issuer'],             'ab');
+        assert.equal(sent['issuerKeyPassword'],  'correct horse battery staple');
+        assert.equal(sent['keyPassword'],        null);
+
+    });
+
+    it('gives the key of a certificate a password from its details', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null) ];
+
+        const root = await open(pkiPage, '/pki', everything, pki, root => root.querySelector('table.pki-list') !== null);
+
+        root.querySelector<HTMLElement>('tr[data-id="aa"]')!.click();
+
+        await until(() => root.querySelector('#key-password-form') !== null, 'the details offered no password for the key');
+
+        assert.equal(root.querySelector('#key-password-form input[name="password"]'), null, 'asked for a password the key does not have');
+
+        field(root, '#key-password-form', 'newPassword').value       = 'correct horse battery staple';
+        field(root, '#key-password-form', 'newPasswordAgain').value  = 'correct horse battery staple';
+
+        submit(root, '#key-password-form');
+
+        await until(() => root.querySelector('#pki-made') !== null, 'nothing said the key has a password now');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/certificates/aa/key/password')!.body as Record<string, unknown>;
+
+        assert.deepEqual(sent, { password: null, newPassword: 'correct horse battery staple' });
+        assert.match(root.querySelector('#pki-made')!.textContent!, /has a password now/);
+
+        await until(() => root.querySelector('#key-password-form input[name="password"]') !== null, 'the details do not ask for the password the key has now');
 
     });
 

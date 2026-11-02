@@ -305,13 +305,139 @@ namespace cloud.charging.open.PKI.Tests
 
         #region AnOperatorLooksAndSignsNothing()
 
+        #region AKeyWithAPasswordIsAskedForAndHandedOutEncrypted()
+
+        /// <summary>
+        /// A root whose key has a password signs only where it is given again;
+        /// a client's key with a password goes out encrypted; a password is
+        /// changed at the permission the certificate asks for - and none of
+        /// them is ever said back, or in the log.
+        /// </summary>
+        [Test]
+        public async Task AKeyWithAPasswordIsAskedForAndHandedOutEncrypted()
+        {
+
+            const String rootPassword    = "correct horse battery staple";
+            const String clientPassword  = "the station's own password";
+
+            await TestPorts.StartedOnFreshPorts(PKIFrom);
+
+            using var admin      = await SignedInAs("admin2",     "systemadmin");
+            using var registrar  = await SignedInAs("registrar2", "registrar");
+
+            var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new {
+                                     subject      = new { commonName = "Locked Root" },
+                                     keyPassword  = rootPassword
+                                 });
+
+            Assert.That(status,                                  Is.EqualTo(HttpStatusCode.Created), root.ToString());
+            Assert.That(root["keyEncrypted"]!.Value<Boolean>(),  Is.True);
+
+            var rootId = root["id"]!.Value<String>();
+
+            #region Without the CA's password, nothing is signed
+
+            (status, var refused) = await Post(registrar, "api/v1/pki/certificates", new {
+                                        issuer   = rootId,
+                                        profile  = "client",
+                                        subject  = new { commonName = "CS-0001" }
+                                    });
+
+            Assert.That(status,              Is.EqualTo(HttpStatusCode.BadRequest), refused.ToString());
+            Assert.That(refused.ToString(),  Does.Contain("has a password, and none was given"));
+
+            (status, refused) = await Post(registrar, "api/v1/pki/certificates", new {
+                                    issuer             = rootId,
+                                    issuerKeyPassword  = "not the password at all",
+                                    profile            = "client",
+                                    subject            = new { commonName = "CS-0001" }
+                                });
+
+            Assert.That(status,              Is.EqualTo(HttpStatusCode.BadRequest), refused.ToString());
+            Assert.That(refused.ToString(),  Does.Not.Contain("not the password at all"));
+
+            #endregion
+
+            #region With it, a client with a password of its own
+
+            (status, var client) = await Post(registrar, "api/v1/pki/certificates", new {
+                                       issuer             = rootId,
+                                       issuerKeyPassword  = rootPassword,
+                                       keyPassword        = clientPassword,
+                                       profile            = "client",
+                                       subject            = new { commonName = "CS-0001" }
+                                   });
+
+            Assert.That(status,                                    Is.EqualTo(HttpStatusCode.Created), client.ToString());
+            Assert.That(client["keyEncrypted"]!.Value<Boolean>(),  Is.True);
+
+            (status, var key) = await Get(registrar, $"api/v1/pki/certificates/{client["id"]}/key");
+
+            Assert.That(status,                              Is.EqualTo(HttpStatusCode.OK), key.ToString());
+            Assert.That(key["encrypted"]!.Value<Boolean>(),  Is.True);
+            Assert.That(key["privateKey"]!.Value<String>(),  Does.StartWith("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+
+            using (var opened = ECDsa.Create())
+                opened.ImportFromEncryptedPem(key["privateKey"]!.Value<String>(), clientPassword);
+
+            #endregion
+
+            #region A CA's password at the permission to make one, a client's at the permission to sign one
+
+            (status, refused) = await Post(registrar, $"api/v1/pki/certificates/{rootId}/key/password", new {
+                                    password     = rootPassword,
+                                    newPassword  = (String?) null
+                                });
+
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Forbidden), refused.ToString());
+
+            (status, var changed) = await Post(registrar, $"api/v1/pki/certificates/{client["id"]}/key/password", new {
+                                        password     = clientPassword,
+                                        newPassword  = (String?) null
+                                    });
+
+            Assert.That(status,                                     Is.EqualTo(HttpStatusCode.OK), changed.ToString());
+            Assert.That(changed["keyEncrypted"]!.Value<Boolean>(),  Is.False);
+
+            (status, var open) = await Post(admin, $"api/v1/pki/certificates/{rootId}/key/password", new {
+                                     password     = rootPassword,
+                                     newPassword  = ""
+                                 });
+
+            Assert.That(status,                                  Is.EqualTo(HttpStatusCode.OK), open.ToString());
+            Assert.That(open["keyEncrypted"]!.Value<Boolean>(),  Is.False);
+
+            (status, var unlocked) = await Post(registrar, "api/v1/pki/certificates", new {
+                                         issuer   = rootId,
+                                         profile  = "server",
+                                         subject  = new { commonName = "csms.example.org" }
+                                     });
+
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), unlocked.ToString());
+
+            #endregion
+
+            #region No password in the log
+
+            var logged = String.Join("\n", Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories).
+                                                     Where (file => !file.EndsWith(".key", StringComparison.Ordinal)).
+                                                     Select(file => { try { return File.ReadAllText(file); } catch (IOException) { return ""; } }));
+
+            Assert.That(logged, Does.Not.Contain(rootPassword).And.Not.Contain(clientPassword));
+
+            #endregion
+
+        }
+
+        #endregion
+
         [Test]
         public async Task AnOperatorLooksAndSignsNothing()
         {
 
             await TestPorts.StartedOnFreshPorts(PKIFrom);
 
-            Assert.That(pki!.Store.TryCreateRootCA(new Issuance.SubjectName("Root"), Issuance.KeyAlgorithm.ECC_P256, 365, null, null,
+            Assert.That(pki!.Store.TryCreateRootCA(new Issuance.SubjectName("Root"), Issuance.KeyAlgorithm.ECC_P256, 365, null, null, null,
                                                    out var root, out var error, out _), Is.True, error);
 
             using var @operator = await SignedInAs("operator1", "operator");

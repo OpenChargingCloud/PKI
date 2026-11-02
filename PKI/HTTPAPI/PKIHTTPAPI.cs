@@ -52,11 +52,18 @@ namespace cloud.charging.open.PKI
     /// |---|---|
     /// | <c>GET v1/pki/certificates</c> | every certificate, <c>?commonName=</c> for those whose common name holds a text, <c>?profile=</c> for one profile |
     /// | <c>GET v1/pki/certificates/{id}</c> | one, with its PEM, its chain and how many it signed |
-    /// | <c>GET v1/pki/certificates/{id}/key</c> | the private key of a server or client certificate made here |
+    /// | <c>GET v1/pki/certificates/{id}/key</c> | the private key of a server or client certificate made here, as it is kept |
+    /// | <c>POST v1/pki/certificates/{id}/key/password</c> | give its private key a password, another one, or none any more |
     /// | <c>DELETE v1/pki/certificates/{id}</c> | delete it for good; <c>?withIssued=true</c> with everything it signed |
     /// | <c>POST v1/pki/rootCAs</c>, <c>POST v1/pki/subCAs</c> | a new root CA, a new sub-CA below a CA |
     /// | <c>POST v1/pki/certificates</c> | a new server or client certificate below a CA, with a key made here |
     /// | <c>POST v1/pki/csr</c>, <c>POST v1/pki/csr/inspect</c> | a certificate for the key of a CSR, and what a CSR says before that |
+    /// </para>
+    /// <para>
+    /// A private key may have a password - "keyPassword" where it is made -
+    /// and need not: a CA whose key has one signs only where the request
+    /// says it again, as "issuerKeyPassword". The PKI keeps no password, and
+    /// says none in its log or its answers.
     /// </para>
     /// <para>
     /// Who asks with an API key of an account - a charging station's backend
@@ -127,6 +134,8 @@ namespace cloud.charging.open.PKI
             AddHandler(root + "/certificates/{id}",      GetCertificate,      HTTPMethod.GET);
             AddHandler(root + "/certificates/{id}",      DeleteCertificate,   HTTPMethod.DELETE);
             AddHandler(root + "/certificates/{id}/key",  GetPrivateKey,       HTTPMethod.GET);
+            AddHandler(root + "/certificates/{id}/key/password",
+                                                          PostKeyPassword,     HTTPMethod.POST);
 
             AddHandler(root + "/rootCAs",                PostRootCA,          HTTPMethod.POST);
             AddHandler(root + "/subCAs",                 PostSubCA,           HTTPMethod.POST);
@@ -170,7 +179,9 @@ namespace cloud.charging.open.PKI
                            new JProperty("total",            PKI.Store.Count),
                            new JProperty("directory",        PKI.Store.Directory),
                            new JProperty("keyAlgorithms",    new JArray(KeyAlgorithm.All.Select(algorithm => algorithm.Name))),
-                           new JProperty("maxValidityDays",  PKIStore.MaxValidityDays)
+                           new JProperty("maxValidityDays",  PKIStore.MaxValidityDays),
+                           new JProperty("minKeyPasswordLength",
+                                                             PKIStore.MinKeyPasswordLength)
                        ))
                    );
 
@@ -207,7 +218,9 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// GET /api/v1/pki/certificates/{id}/key: the private key of a server
-        /// or client certificate this PKI made the key of, as PKCS#8 PEM.
+        /// or client certificate this PKI made the key of, as PKCS#8 PEM - as
+        /// it is kept: encrypted where it has a password, for whoever has it
+        /// to open with the password, and "encrypted" says which.
         /// </summary>
         /// <remarks>
         /// Never the key of a CA: whoever has that signs as the CA, from
@@ -238,14 +251,76 @@ namespace cloud.charging.open.PKI
                                                      ? $"'{certificate.CommonName}' was signed for a CSR: its private key never was here."
                                                      : $"The private key of '{certificate.CommonName}' is not in this PKI any more."));
 
-            Log.Notice($"'{user.Id}' downloaded the private key of the {certificate.Profile.InWords()} '{certificate.CommonName}' ({certificate.Id}).",
+            Log.Notice($"'{user.Id}' downloaded the private key of the {certificate.Profile.InWords()} '{certificate.CommonName}' ({certificate.Id}){(certificate.KeyEncrypted ? ", encrypted with its password" : "")}.",
                        "pki", "security", "web");
 
             return Task.FromResult(
                        JSONResponse(Request, HTTPStatusCode.OK, new JObject(
                            new JProperty("id",          certificate.Id),
-                           new JProperty("privateKey",  key)
+                           new JProperty("privateKey",  key),
+                           new JProperty("encrypted",   certificate.KeyEncrypted)
                        ))
+                   );
+
+        }
+
+        #endregion
+
+        #region (private) PostKeyPassword(Request)
+
+        /// <summary>
+        /// POST /api/v1/pki/certificates/{id}/key/password: give the private
+        /// key of a certificate made here a password, another one, or none any
+        /// more - {"password", "newPassword"}, either of them null or left out
+        /// for none - answered 200 with the certificate.
+        /// </summary>
+        /// <remarks>
+        /// A CA's key at the permission to make one, a server's or a client's
+        /// at the permission to sign one. Each change is said in the log, at
+        /// Notice, with who - and never with a password.
+        /// </remarks>
+        private Task<HTTPResponse> PostKeyPassword(HTTPRequest Request)
+        {
+
+            if (!TryMayRead(Request, true, out var user, out var refused))
+                return Task.FromResult(refused);
+
+            var certificate = PKI.Store.Get(IdOf(Request));
+
+            if (certificate is null)
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.NotFound, $"There is no certificate '{IdOf(Request)}' in this PKI."));
+
+            var required = Permission.Edit(certificate.Profile.IsCA() ? PKIAccess.Authorities : PKIAccess.Issuance);
+
+            if (!PKI.IsAllowed(user, [ required ]))
+                return Task.FromResult(RefusePermission(Request, user, [ required ], null));
+
+            if (!TryParseJSONObject(Request, out var json, out var errorResponse))
+                return Task.FromResult(errorResponse);
+
+            if (!TryReadPassword(json, "password",     out var password,     out var error) ||
+                !TryReadPassword(json, "newPassword",  out var newPassword,  out error))
+            {
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error));
+            }
+
+            var had = certificate.KeyEncrypted;
+
+            if (!PKI.Store.TryChangeKeyPassword(certificate.Id, password, newPassword, out var changed, out error, out var notFound, out var notSaved))
+                return Task.FromResult(NotChanged(Request, notFound ? HTTPStatusCode.NotFound : HTTPStatusCode.BadRequest, error, notSaved));
+
+            var what = (had, newPassword is not null) switch {
+                           (false, true)   => "gave a password to",
+                           (true,  true)   => "changed the password of",
+                           (true,  false)  => "took the password from",
+                           _               => "left without a password"
+                       };
+
+            Log.Notice($"'{user.Id}' {what} the private key of the {changed.Profile.InWords()} '{changed.CommonName}' ({changed.Id}).",
+                       "pki", "security", "web");
+
+            return Task.FromResult(
+                       JSONResponse(Request, HTTPStatusCode.OK, DetailsJSON(changed, user))
                    );
 
         }
@@ -315,7 +390,7 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// POST /api/v1/pki/rootCAs: a new root CA - {"subject", "keyAlgorithm",
-        /// "validDays", "pathLength"} - answered 201 with the CA.
+        /// "validDays", "pathLength", "keyPassword"} - answered 201 with the CA.
         /// </summary>
         private Task<HTTPResponse> PostRootCA(HTTPRequest Request)
         {
@@ -329,12 +404,13 @@ namespace cloud.charging.open.PKI
             if (!SubjectName.TryParse(json["subject"], out var subject, out var error) ||
                 !TryReadKeyAlgorithm(json, KeyAlgorithm.ECC_P384, out var keyAlgorithm, out error) ||
                 !TryReadInt32       (json, "validDays",  3650,    out var validDays,    out error)     ||
-                !TryReadOptional    (json, "pathLength",          out var pathLength,   out error))
+                !TryReadOptional    (json, "pathLength",          out var pathLength,   out error)     ||
+                !TryReadPassword    (json, "keyPassword",         out var keyPassword,  out error))
             {
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error!));
             }
 
-            if (!PKI.Store.TryCreateRootCA(subject, keyAlgorithm, validDays.Value, pathLength, user.Id.ToString(),
+            if (!PKI.Store.TryCreateRootCA(subject, keyAlgorithm, validDays.Value, pathLength, keyPassword, user.Id.ToString(),
                                            out var certificate, out error, out var notSaved))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
@@ -350,8 +426,9 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// POST /api/v1/pki/subCAs: a new sub-CA below a CA of this PKI -
-        /// {"issuer", "subject", "keyAlgorithm", "validDays", "pathLength"} -
-        /// answered 201 with the sub-CA.
+        /// {"issuer", "issuerKeyPassword", "subject", "keyAlgorithm",
+        /// "validDays", "pathLength", "keyPassword"} - answered 201 with the
+        /// sub-CA.
         /// </summary>
         private Task<HTTPResponse> PostSubCA(HTTPRequest Request)
         {
@@ -366,12 +443,14 @@ namespace cloud.charging.open.PKI
                 !SubjectName.TryParse(json["subject"],            out var subject,      out error)     ||
                 !TryReadKeyAlgorithm(json, KeyAlgorithm.ECC_P384, out var keyAlgorithm, out error)     ||
                 !TryReadInt32       (json, "validDays",  1825,    out var validDays,    out error)     ||
-                !TryReadOptional    (json, "pathLength",          out var pathLength,   out error))
+                !TryReadOptional    (json, "pathLength",          out var pathLength,   out error)     ||
+                !TryReadPassword    (json, "issuerKeyPassword",   out var issuerKey,    out error)     ||
+                !TryReadPassword    (json, "keyPassword",         out var keyPassword,  out error))
             {
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error!));
             }
 
-            if (!PKI.Store.TryIssue(issuer, CertificateProfile.SubCA, subject, keyAlgorithm, validDays.Value, [], pathLength, user.Id.ToString(),
+            if (!PKI.Store.TryIssue(issuer, issuerKey, CertificateProfile.SubCA, subject, keyAlgorithm, validDays.Value, [], pathLength, keyPassword, user.Id.ToString(),
                                     out var certificate, out error, out var notSaved))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
@@ -388,8 +467,9 @@ namespace cloud.charging.open.PKI
         /// <summary>
         /// POST /api/v1/pki/certificates: a new certificate for a server or a
         /// client below a CA of this PKI, with a key made here - {"issuer",
-        /// "profile", "subject", "keyAlgorithm", "validDays",
-        /// "subjectAlternativeNames"} - answered 201 with the certificate.
+        /// "issuerKeyPassword", "profile", "subject", "keyAlgorithm",
+        /// "validDays", "subjectAlternativeNames", "keyPassword"} - answered
+        /// 201 with the certificate.
         /// </summary>
         private Task<HTTPResponse> PostCertificate(HTTPRequest Request)
         {
@@ -405,12 +485,14 @@ namespace cloud.charging.open.PKI
                 !SubjectName.TryParse(json["subject"],            out var subject,      out error)     ||
                 !TryReadKeyAlgorithm(json, KeyAlgorithm.ECC_P256, out var keyAlgorithm, out error)     ||
                 !TryReadInt32       (json, "validDays",  365,     out var validDays,    out error)     ||
-                !AlternativeNames.TryParse(json["subjectAlternativeNames"], out var names, out error))
+                !AlternativeNames.TryParse(json["subjectAlternativeNames"], out var names, out error) ||
+                !TryReadPassword    (json, "issuerKeyPassword",   out var issuerKey,    out error)     ||
+                !TryReadPassword    (json, "keyPassword",         out var keyPassword,  out error))
             {
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error!));
             }
 
-            if (!PKI.Store.TryIssue(issuer, profile, subject, keyAlgorithm, validDays.Value, names, null, user.Id.ToString(),
+            if (!PKI.Store.TryIssue(issuer, issuerKey, profile, subject, keyAlgorithm, validDays.Value, names, null, keyPassword, user.Id.ToString(),
                                     out var certificate, out error, out var notSaved))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
@@ -426,8 +508,8 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// POST /api/v1/pki/csr: a certificate below a CA of this PKI for the
-        /// key of a certificate signing request - {"issuer", "profile", "csr",
-        /// "validDays", "subjectAlternativeNames",
+        /// key of a certificate signing request - {"issuer", "issuerKeyPassword",
+        /// "profile", "csr", "validDays", "subjectAlternativeNames",
         /// "takeSubjectAlternativeNames", "pathLength"} - answered 201 with the
         /// certificate.
         /// </summary>
@@ -459,7 +541,8 @@ namespace cloud.charging.open.PKI
             if (!TryReadIssuer      (json,                     out var issuer,      out var error) ||
                 !TryReadInt32       (json, "validDays",  365,  out var validDays,   out error)     ||
                 !TryReadOptional    (json, "pathLength",       out var pathLength,  out error)     ||
-                !AlternativeNames.TryParse(json["subjectAlternativeNames"], out var names, out error))
+                !AlternativeNames.TryParse(json["subjectAlternativeNames"], out var names, out error) ||
+                !TryReadPassword    (json, "issuerKeyPassword", out var issuerKey,  out error))
             {
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error!));
             }
@@ -467,7 +550,7 @@ namespace cloud.charging.open.PKI
             if (json["csr"]?.Type != JTokenType.String)
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, "'csr' is the certificate signing request, as PEM."));
 
-            if (!PKI.Store.TryIssueFromCSR(issuer, profile.Value, json.Value<String>("csr")!, validDays.Value, names,
+            if (!PKI.Store.TryIssueFromCSR(issuer, issuerKey, profile.Value, json.Value<String>("csr")!, validDays.Value, names,
                                            json.Value<Boolean?>("takeSubjectAlternativeNames") ?? true,
                                            pathLength, user.Id.ToString(),
                                            out var certificate, out error, out var notSaved))
@@ -686,6 +769,37 @@ namespace cloud.charging.open.PKI
 
             Error = $"'{text}' is no key algorithm of this PKI: {String.Join(", ", Issuance.KeyAlgorithm.All.Select(algorithm => algorithm.Name))}.";
             return false;
+
+        }
+
+        /// <summary>
+        /// A password of a private key: a text, or none - left out, null or
+        /// empty. Its length is the store's to judge.
+        /// </summary>
+        private static Boolean TryReadPassword(JObject                           JSON,
+                                               String                            Key,
+                                               out String?                       Password,
+                                               [NotNullWhen(false)] out String?  Error)
+        {
+
+            Password = null;
+            Error    = null;
+
+            var token = JSON[Key];
+
+            if (token is null || token.Type == JTokenType.Null)
+                return true;
+
+            if (token.Type != JTokenType.String)
+            {
+                Error = $"'{Key}' is a password, as a text.";
+                return false;
+            }
+
+            var text = token.Value<String>();
+
+            Password = String.IsNullOrEmpty(text) ? null : text;
+            return true;
 
         }
 

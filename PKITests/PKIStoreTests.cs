@@ -81,16 +81,17 @@ namespace cloud.charging.open.PKI.Tests
 
         #region (helpers)
 
-        private IssuedCertificate Root(String CommonName = "Test Root CA", KeyAlgorithm? Key = null, Int32? PathLength = null, Int32 Days = 3650)
+        private IssuedCertificate Root(String CommonName = "Test Root CA", KeyAlgorithm? Key = null, Int32? PathLength = null, Int32 Days = 3650, String? KeyPassword = null)
         {
-            Assert.That(Store.TryCreateRootCA(new SubjectName(CommonName, "OpenChargingCloud", Country: "DE"), Key ?? KeyAlgorithm.ECC_P384, Days, PathLength, "alice",
+            Assert.That(Store.TryCreateRootCA(new SubjectName(CommonName, "OpenChargingCloud", Country: "DE"), Key ?? KeyAlgorithm.ECC_P384, Days, PathLength, KeyPassword, "alice",
                                               out var root, out var error, out _), Is.True, error);
             return root!;
         }
 
-        private IssuedCertificate Issue(IssuedCertificate Issuer, CertificateProfile Profile, String CommonName, KeyAlgorithm? Key = null, Int32 Days = 365, IReadOnlyList<String>? Names = null, Int32? PathLength = null)
+        private IssuedCertificate Issue(IssuedCertificate Issuer, CertificateProfile Profile, String CommonName, KeyAlgorithm? Key = null, Int32 Days = 365, IReadOnlyList<String>? Names = null, Int32? PathLength = null,
+                                        String? IssuerKeyPassword = null, String? KeyPassword = null)
         {
-            Assert.That(Store.TryIssue(Issuer.Id, Profile, new SubjectName(CommonName), Key ?? KeyAlgorithm.ECC_P256, Days, Names ?? [], PathLength, "alice",
+            Assert.That(Store.TryIssue(Issuer.Id, IssuerKeyPassword, Profile, new SubjectName(CommonName), Key ?? KeyAlgorithm.ECC_P256, Days, Names ?? [], PathLength, KeyPassword, "alice",
                                        out var issued, out var error, out _), Is.True, error);
             return issued!;
         }
@@ -243,7 +244,7 @@ namespace cloud.charging.open.PKI.Tests
             var root   = Root();
             var subCA  = Issue(root, CertificateProfile.SubCA, "Operator CA", PathLength: 0);
 
-            var signed = Store.TryIssue(subCA.Id, CertificateProfile.SubCA, new SubjectName("Below"), KeyAlgorithm.ECC_P256, 30, [], null, null,
+            var signed = Store.TryIssue(subCA.Id, null, CertificateProfile.SubCA, new SubjectName("Below"), KeyAlgorithm.ECC_P256, 30, [], null, null, null,
                                         out _, out var error, out _);
 
             Assert.That(signed, Is.False);
@@ -257,7 +258,7 @@ namespace cloud.charging.open.PKI.Tests
 
             var root   = Root(Days: 100);
 
-            var signed = Store.TryIssue(root.Id, CertificateProfile.Client, new SubjectName("Too long"), KeyAlgorithm.ECC_P256, 365, [], null, null,
+            var signed = Store.TryIssue(root.Id, null, CertificateProfile.Client, new SubjectName("Too long"), KeyAlgorithm.ECC_P256, 365, [], null, null, null,
                                         out _, out var error, out _);
 
             Assert.That(signed, Is.False);
@@ -272,7 +273,7 @@ namespace cloud.charging.open.PKI.Tests
             var root    = Root();
             var client  = Issue(root, CertificateProfile.Client, "CS-0001");
 
-            var signed  = Store.TryIssue(client.Id, CertificateProfile.Client, new SubjectName("Below a leaf"), KeyAlgorithm.ECC_P256, 30, [], null, null,
+            var signed  = Store.TryIssue(client.Id, null, CertificateProfile.Client, new SubjectName("Below a leaf"), KeyAlgorithm.ECC_P256, 30, [], null, null, null,
                                          out _, out var error, out _);
 
             Assert.That(signed, Is.False);
@@ -300,7 +301,7 @@ namespace cloud.charging.open.PKI.Tests
             Assert.That(inspection.KeyAlgorithm,              Is.EqualTo("ecc-p256"));
             Assert.That(inspection.SubjectAlternativeNames,   Is.EqualTo(new[] { "cs-4711.cpo.example" }));
 
-            Assert.That(Store.TryIssueFromCSR(root.Id, CertificateProfile.Client, csr, 365, [], true, null, "registrar",
+            Assert.That(Store.TryIssueFromCSR(root.Id, null, CertificateProfile.Client, csr, 365, [], true, null, "registrar",
                                               out var issued, out var error, out _), Is.True, error);
 
             using var certificate = Store.Load(issued!.Id)!;
@@ -339,7 +340,7 @@ namespace cloud.charging.open.PKI.Tests
             Assert.That(PKIStore.TryInspectCSR(tampered, out var inspection, out var inspectError), Is.True, inspectError);
             Assert.That(inspection!.SignatureValid, Is.False);
 
-            Assert.That(Store.TryIssueFromCSR(root.Id, CertificateProfile.Client, tampered, 30, [], true, null, null,
+            Assert.That(Store.TryIssueFromCSR(root.Id, null, CertificateProfile.Client, tampered, 30, [], true, null, null,
                                               out _, out var error, out _), Is.False);
             Assert.That(error, Does.Contain("signature"));
 
@@ -353,7 +354,7 @@ namespace cloud.charging.open.PKI.Tests
 
             using var key = RSA.Create(1024);
 
-            Assert.That(Store.TryIssueFromCSR(root.Id, CertificateProfile.Client, CSR(key, "CN=Weak"), 30, [], true, null, null,
+            Assert.That(Store.TryIssueFromCSR(root.Id, null, CertificateProfile.Client, CSR(key, "CN=Weak"), 30, [], true, null, null,
                                               out _, out var error, out _), Is.False);
             Assert.That(error, Does.Contain("RSA 1024"));
 
@@ -380,6 +381,189 @@ namespace cloud.charging.open.PKI.Tests
                 Assert.That(Store.Find(null, CertificateProfile.RootCA).Single().CommonName, Is.EqualTo("OCC Root"));
                 Assert.That(Store.Find("nothing like it"),                         Is.Empty);
             });
+
+        }
+
+        #endregion
+
+        #region A key with a password, and one without
+
+        private const String  CAPassword     = "correct horse battery staple";
+        private const String  OtherPassword  = "another one, just as long";
+
+        /// <summary>
+        /// A key opened with its password, and checked to be the one of its
+        /// certificate: the key the certificate is for, and nothing else.
+        /// </summary>
+        private void OpensWith(IssuedCertificate Certificate, String Password)
+        {
+
+            using var certificate  = Store.Load(Certificate.Id)!;
+            using var key          = ECDsa.Create();
+
+            key.ImportFromEncryptedPem(Store.PrivateKeyPEM(Certificate.Id)!, Password);
+
+            using var withKey = certificate.CopyWithPrivateKey(key);
+
+            Assert.That(withKey.HasPrivateKey, Is.True);
+
+        }
+
+        [Test]
+        public void AKeyIsKeptUnencryptedUnlessItIsGivenAPassword()
+        {
+
+            var open    = Root("Open Root");
+            var locked  = Root("Locked Root", KeyPassword: CAPassword);
+
+            Assert.Multiple(() => {
+                Assert.That(open.KeyEncrypted,                     Is.False);
+                Assert.That(Store.PrivateKeyPEM(open.Id),          Does.StartWith("-----BEGIN PRIVATE KEY-----"));
+                Assert.That(locked.KeyEncrypted,                   Is.True);
+                Assert.That(locked.HasPrivateKey,                  Is.True);
+                Assert.That(Store.PrivateKeyPEM(locked.Id),        Does.StartWith("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+                Assert.That(Store.PrivateKeyPEM(locked.Id),        Does.Not.Contain(CAPassword));
+            });
+
+            OpensWith(locked, CAPassword);
+
+        }
+
+        [Test]
+        public void ACAWhoseKeyHasAPasswordSignsOnlyWithIt()
+        {
+
+            var root = Root(KeyPassword: CAPassword);
+
+            var withNone   = Store.TryIssue(root.Id, null,          CertificateProfile.Client, new SubjectName("CS-0001"), KeyAlgorithm.ECC_P256, 30, [], null, null, null,
+                                            out _, out var noneError, out _);
+
+            var withWrong  = Store.TryIssue(root.Id, OtherPassword, CertificateProfile.Client, new SubjectName("CS-0001"), KeyAlgorithm.ECC_P256, 30, [], null, null, null,
+                                            out _, out var wrongError, out _);
+
+            Assert.Multiple(() => {
+                Assert.That(withNone,     Is.False);
+                Assert.That(noneError,    Does.Contain("has a password, and none was given"));
+                Assert.That(withWrong,    Is.False);
+                Assert.That(wrongError,   Does.Contain("is not the one of its private key"));
+                Assert.That(Store.Count,  Is.EqualTo(1));
+            });
+
+            var client = Issue(root, CertificateProfile.Client, "CS-0001", IssuerKeyPassword: CAPassword);
+
+            Assert.Multiple(() => {
+                Assert.That(Chains(client, root, out var problems), Is.True, problems);
+                Assert.That(client.KeyEncrypted, Is.False, "a key below a CA with a password has none of its own unless it is given one");
+            });
+
+        }
+
+        [Test]
+        public void ACSRIsSignedBelowACAWithAPasswordOnlyWithIt()
+        {
+
+            var root      = Root(KeyPassword: CAPassword);
+
+            using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var csr       = CSR(key, "CN=CS-0003");
+
+            Assert.That(Store.TryIssueFromCSR(root.Id, null,       CertificateProfile.Client, csr, 30, [], true, null, null, out _, out _, out _), Is.False);
+            Assert.That(Store.TryIssueFromCSR(root.Id, CAPassword, CertificateProfile.Client, csr, 30, [], true, null, null, out var issued, out var error, out _), Is.True, error);
+            Assert.That(Chains(issued!, root, out var problems), Is.True, problems);
+
+        }
+
+        [Test]
+        public void TheKeyOfAClientMayHaveAPasswordOfItsOwn()
+        {
+
+            var root    = Root();
+            var client  = Issue(root, CertificateProfile.Client, "CS-0004", KeyPassword: OtherPassword);
+
+            Assert.Multiple(() => {
+                Assert.That(client.KeyEncrypted,             Is.True);
+                Assert.That(Store.PrivateKeyPEM(client.Id),  Does.StartWith("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+            });
+
+            OpensWith(client, OtherPassword);
+
+        }
+
+        [Test]
+        public void APasswordTooShortIsRefusedAndNothingIsKept()
+        {
+
+            Assert.That(Store.TryCreateRootCA(new SubjectName("Root"), KeyAlgorithm.ECC_P256, 365, null, "short", null, out _, out var error, out _), Is.False);
+            Assert.That(error,        Does.Contain($"{PKIStore.MinKeyPasswordLength} characters at least"));
+            Assert.That(Store.Count,  Is.EqualTo(0));
+
+        }
+
+        [Test]
+        public void APasswordIsGivenChangedAndTakenAway()
+        {
+
+            var root = Root();
+
+            // Given ...
+            Assert.That(Store.TryChangeKeyPassword(root.Id, null, CAPassword, out var given, out var error, out _, out _), Is.True, error);
+            Assert.That(given!.KeyEncrypted, Is.True);
+            OpensWith(root, CAPassword);
+
+            // ... not changed with the wrong one, and the key left as it was ...
+            Assert.That(Store.TryChangeKeyPassword(root.Id, OtherPassword, null, out _, out error, out var notFound, out _), Is.False);
+            Assert.That(error,     Does.Contain("is not the one of its private key"));
+            Assert.That(notFound,  Is.False);
+            OpensWith(root, CAPassword);
+
+            // ... changed ...
+            Assert.That(Store.TryChangeKeyPassword(root.Id, CAPassword, OtherPassword, out _, out error, out _, out _), Is.True, error);
+            OpensWith(root, OtherPassword);
+            Issue(root, CertificateProfile.Client, "CS-0005", IssuerKeyPassword: OtherPassword);
+
+            // ... and taken away: the CA signs without one again.
+            Assert.That(Store.TryChangeKeyPassword(root.Id, OtherPassword, null, out var open, out error, out _, out _), Is.True, error);
+            Assert.That(open!.KeyEncrypted,             Is.False);
+            Assert.That(Store.PrivateKeyPEM(root.Id),   Does.StartWith("-----BEGIN PRIVATE KEY-----"));
+            Assert.That(Directory.GetFiles(directory, "*.tmp"), Is.Empty);
+            Issue(root, CertificateProfile.Client, "CS-0006");
+
+        }
+
+        [Test]
+        public void AKeyThatIsNotHereHasNoPasswordToChange()
+        {
+
+            var root      = Root();
+
+            using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+
+            Assert.That(Store.TryIssueFromCSR(root.Id, null, CertificateProfile.Client, CSR(key, "CN=CS-0007"), 30, [], true, null, null, out var issued, out var error, out _), Is.True, error);
+            Assert.That(Store.TryChangeKeyPassword(issued!.Id, null, CAPassword, out _, out error, out var notFound, out _), Is.False);
+            Assert.That(notFound,  Is.True);
+            Assert.That(error,     Does.Contain("signed for a CSR"));
+
+        }
+
+        [Test]
+        public void WhetherAKeyHasAPasswordIsReadFromItsFileAfterARestart()
+        {
+
+            var locked  = Root("Locked Root", KeyPassword: CAPassword);
+            var open    = Root("Open Root");
+
+            // The index says otherwise; the key file is what counts.
+            var index = File.ReadAllText(store!.IndexFile).Replace("\"keyEncrypted\": true", "\"keyEncrypted\": false");
+            File.WriteAllText(store.IndexFile, index);
+
+            store = new PKIStore(directory);
+
+            Assert.Multiple(() => {
+                Assert.That(Store.Get(locked.Id)!.KeyEncrypted,  Is.True);
+                Assert.That(Store.Get(open.Id)!.KeyEncrypted,    Is.False);
+            });
+
+            Issue(Store.Get(locked.Id)!, CertificateProfile.Server, "csms.example.org", IssuerKeyPassword: CAPassword);
 
         }
 

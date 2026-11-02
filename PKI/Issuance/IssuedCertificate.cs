@@ -35,6 +35,9 @@ namespace cloud.charging.open.PKI.Issuance
     /// a thousand of them is drawn without reading a thousand files. The
     /// certificate itself is the file beside it, and is what anything that
     /// signs or is shown reads.
+    ///
+    /// Whether its key is encrypted is what the key file says, as whether
+    /// there is one is: the store reads both from the disk when it starts.
     /// </remarks>
     public sealed record IssuedCertificate(String                  Id,
                                            CertificateProfile      Profile,
@@ -49,6 +52,7 @@ namespace cloud.charging.open.PKI.Issuance
                                            IReadOnlyList<String>   SubjectAlternativeNames,
                                            Int32?                  PathLength,
                                            Boolean                 HasPrivateKey,
+                                           Boolean                 KeyEncrypted,
                                            Boolean                 FromCSR,
                                            DateTimeOffset          CreatedAt,
                                            String?                 CreatedBy)
@@ -93,6 +97,7 @@ namespace cloud.charging.open.PKI.Issuance
                            new JProperty("subjectAlternativeNames",  new JArray(SubjectAlternativeNames)),
                            new JProperty("pathLength",               PathLength),
                            new JProperty("hasPrivateKey",            HasPrivateKey),
+                           new JProperty("keyEncrypted",             KeyEncrypted),
                            new JProperty("fromCSR",                  FromCSR),
                            new JProperty("createdAt",                CreatedAt.ToString("o", CultureInfo.InvariantCulture)),
                            new JProperty("createdBy",                CreatedBy)
@@ -141,6 +146,7 @@ namespace cloud.charging.open.PKI.Issuance
                            SubjectAlternativeNames:  json["subjectAlternativeNames"]?.Values<String>().OfType<String>().ToList() ?? [],
                            PathLength:               json.Value<Int32?>("pathLength"),
                            HasPrivateKey:            json.Value<Boolean?>("hasPrivateKey") ?? false,
+                           KeyEncrypted:             json.Value<Boolean?>("keyEncrypted")  ?? false,
                            FromCSR:                  json.Value<Boolean?>("fromCSR")       ?? false,
                            CreatedAt:                DateTimeOffset.Parse(json.Value<String>("createdAt")!, CultureInfo.InvariantCulture),
                            CreatedBy:                json.Value<String>("createdBy")

@@ -240,8 +240,17 @@ namespace cloud.charging.open.PKI
             foreach (var passedOver in Store.PassedOver)
                 this.Log.Warning($"PKI: {passedOver}", "pki", "security");
 
+            // What whoever can read the directory can sign as: every CA whose
+            // key has no password.
+            var caKeys       = Store.Find().Where(certificate => certificate.Profile.IsCA() && certificate.HasPrivateKey).ToList();
+            var unprotected  = caKeys.Count(certificate => !certificate.KeyEncrypted);
+
             this.Log.Info($"The PKI keeps {Store.Count} certificate(s) in '{Store.Directory}'. " +
-                           "The private keys of its CAs are kept there unencrypted: whoever can read that directory can sign as every one of them.",
+                          (caKeys.Count == 0
+                               ? "It has the private key of no CA yet."
+                               : unprotected == 0
+                                     ? $"The private keys of its {caKeys.Count} CA(s) all have a password."
+                                     : $"The private key of {unprotected} of its {caKeys.Count} CA(s) has no password: whoever can read that directory can sign as {(unprotected == 1 ? "that CA" : "each of them")}."),
                           "pki", "security");
 
             #endregion
@@ -321,7 +330,10 @@ namespace cloud.charging.open.PKI
                               new JProperty("rootCAs",        all.Count(certificate => certificate.Profile == CertificateProfile.RootCA)),
                               new JProperty("subCAs",         all.Count(certificate => certificate.Profile == CertificateProfile.SubCA)),
                               new JProperty("servers",        all.Count(certificate => certificate.Profile == CertificateProfile.Server)),
-                              new JProperty("clients",        all.Count(certificate => certificate.Profile == CertificateProfile.Client))
+                              new JProperty("clients",        all.Count(certificate => certificate.Profile == CertificateProfile.Client)),
+                              new JProperty("keys",           all.Count(certificate => certificate.HasPrivateKey)),
+                              new JProperty("keysWithPassword",
+                                                              all.Count(certificate => certificate.HasPrivateKey && certificate.KeyEncrypted))
                           )));
 
             return json;

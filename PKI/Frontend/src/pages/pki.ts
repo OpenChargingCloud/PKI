@@ -25,6 +25,11 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  * form ends in: whatever is made is opened in it at once, and what is typed
  * into one form is still there after a look at the list. Each form is a draft
  * the page holds until it is sent; the filter is none.
+ *
+ * A key made here may be given a password, and need not. A CA whose key has
+ * one signs only where its password is given again, so a form shows the field
+ * for it once such a CA is chosen to sign; the details of a certificate give
+ * its key a password, change it or take it away. The PKI keeps none of them.
  */
 
 /** What a profile is called in a sentence and on a chip. */
@@ -155,6 +160,9 @@ export const pkiPage: Page = {
         /** What the last form made, said above the list it was opened in. */
         let made                                           = '';
 
+        /** The CA each form has chosen to sign, by the id of the form; its first where none was. */
+        const issuerChosen: Record<string, string> = {};
+
         /** What the CSR in its box says, once the PKI has been asked. */
         let csrPreview:     CSRInspection | null           = null;
         let csrProblem                                     = '';
@@ -283,7 +291,9 @@ export const pkiPage: Page = {
                                                       <td>${day(certificate.notAfter)}</td>
                                                       <td>${statusChip(certificate)}</td>
                                                       <td>${certificate.hasPrivateKey
-                                                                ? html`<i class="fa-solid fa-key" title="Its private key is in this PKI"></i>`
+                                                                ? certificate.keyEncrypted
+                                                                      ? html`<i class="fa-solid fa-lock" title="Its private key is in this PKI, with a password"></i>`
+                                                                      : html`<i class="fa-solid fa-key" title="Its private key is in this PKI, without a password"></i>`
                                                                 : certificate.fromCSR ? html`<span class="muted">CSR</span>` : nothing}</td>
                                                   </tr>
                                               `)}
@@ -333,7 +343,11 @@ export const pkiPage: Page = {
                         ${certificate.chain.map((step, at) => html`${at > 0 ? html`<i class="fa-solid fa-arrow-left chain-step muted"></i>` : nothing}<button type="button" class="btn small chain-step" ?disabled=${step.id === certificate.id} @click=${() => void open(step.id)}>${step.commonName}</button>`)}
                     </span></div>
                     <div class="kv"><span class="k">Valid</span><span class="v">from ${moment(certificate.notBefore)} until ${moment(certificate.notAfter)} ${statusChip(certificate)}</span></div>
-                    <div class="kv"><span class="k">Key</span><span class="v">${keyName(certificate.keyAlgorithm)}${certificate.hasPrivateKey ? ', its private key in this PKI' : ''}</span></div>
+                    <div class="kv"><span class="k">Key</span><span class="v">${keyName(certificate.keyAlgorithm)}${certificate.hasPrivateKey
+                                                                                                                  ? certificate.keyEncrypted
+                                                                                                                        ? ', its private key in this PKI, with a password'
+                                                                                                                        : ', its private key in this PKI, without a password'
+                                                                                                                  : ''}</span></div>
                     ${certificate.subjectAlternativeNames.length > 0 ? html`
                         <div class="kv"><span class="k">Other names</span><span class="v">${certificate.subjectAlternativeNames.map(name => html`<code>${name}</code> `)}</span></div>` : nothing}
                     ${isCA ? html`
@@ -368,8 +382,62 @@ export const pkiPage: Page = {
 
                     <pre class="pem">${certificate.pem}</pre>
 
+                    ${certificate.hasPrivateKey && mayDelete ? keyPasswordView(certificate) : nothing}
+
                 </section>
             `;
+
+        }
+
+        /** Give the key of a certificate a password, change it, or take it away. */
+        function keyPasswordView(Certificate: PKICertificateDetails): TemplateResult {
+            return html`
+                <form id="key-password-form" class="form-stack key-password" @submit=${(event: SubmitEvent) => onKeyPassword(event, Certificate)}>
+
+                    <h3><i class="fa-solid fa-lock"></i> Password of its private key</h3>
+
+                    <p class="hint">
+                        ${Certificate.keyEncrypted
+                              ? 'Its key has a password. A new one replaces it; none takes it away, and the key is kept unencrypted.'
+                              : 'Its key has no password: whoever can read the directory of this PKI can use it. A password is optional.'}
+                    </p>
+
+                    ${Certificate.keyEncrypted ? html`
+                        <label>The password it has
+                            <input type="password" name="password" required autocomplete="off" />
+                        </label>` : nothing}
+
+                    ${newPasswordFields(Certificate.keyEncrypted ? 'Empty, to take the password away.' : '', Certificate.keyEncrypted ? 'The new password' : 'Password of its key')}
+
+                    ${formActions('key-password', Certificate.keyEncrypted ? 'Change the password' : 'Give it a password')}
+
+                </form>
+            `;
+        }
+
+        function onKeyPassword(event: SubmitEvent, Certificate: PKICertificateDetails): void {
+
+            event.preventDefault();
+
+            const form         = event.currentTarget as HTMLFormElement;
+            const newPassword  = newPasswordOf(form, 'key-password');
+
+            if (newPassword === undefined)
+                return;
+
+            if (newPassword === null && !Certificate.keyEncrypted) {
+                must<HTMLElement>(content, '#key-password-error').textContent = 'Its key has no password, and none was given.';
+                return;
+            }
+
+            const password = Certificate.keyEncrypted ? field(form, 'password', false) : null;
+
+            void make(form, 'key-password', () => api.pki.keyPassword(Certificate.id, password, newPassword),
+                      changed => newPassword === null
+                                     ? `The private key of '${changed.commonName}' has no password any more.`
+                                     : Certificate.keyEncrypted
+                                           ? `The private key of '${changed.commonName}' has a new password.`
+                                           : `The private key of '${changed.commonName}' has a password now.`);
 
         }
 
@@ -416,6 +484,8 @@ export const pkiPage: Page = {
             {
                 const key = await api.pki.privateKey(Certificate.id);
                 download(fileName(Certificate, '.key.pem'), key.privateKey);
+                if (key.encrypted)
+                    must<HTMLElement>(content, '#pki-details-note').textContent = 'The key is encrypted with its password, which whatever opens it asks for.';
             }
             catch (problem)
             {
@@ -520,17 +590,79 @@ export const pkiPage: Page = {
             `;
         }
 
-        function issuerField(pki: PKICertificates, ForACA: boolean): TemplateResult {
+        /** The CA a form has chosen to sign: the one picked, or the first that can. */
+        function chosenIssuer(pki: PKICertificates, FormId: string, ForACA: boolean): PKICertificate | undefined {
+            const all = signers(pki.certificates, ForACA);
+            return all.find(ca => ca.id === issuerChosen[FormId]) ?? all[0];
+        }
+
+        /**
+         * Who signs it - and the password of its key, asked for only where
+         * the CA chosen has one: a field that is not shown is no field of the
+         * form, and sends nothing.
+         */
+        function issuerField(pki: PKICertificates, ForACA: boolean, FormId: string): TemplateResult {
+
+            const chosen   = chosenIssuer(pki, FormId, ForACA);
+            const locked   = chosen?.keyEncrypted ?? false;
+
             return html`
                 <label>Signed by
-                    <select name="issuer" required>
+                    <select name="issuer" required
+                            @change=${(event: Event) => { issuerChosen[FormId] = (event.currentTarget as HTMLSelectElement).value; draw(); }}>
                         ${repeat(signers(pki.certificates, ForACA), ca => ca.id, ca => html`
-                            <option value="${ca.id}">${ca.commonName} - ${profileWords[ca.profile]}, until ${day(ca.notAfter)}</option>
+                            <option value="${ca.id}" ?selected=${ca.id === chosen?.id}>${ca.commonName} - ${profileWords[ca.profile]}, until ${day(ca.notAfter)}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
                         `)}
                     </select>
                     <span class="hint">A CA of this PKI that is valid now and whose key is here.</span>
                 </label>
+                <label class="issuer-key-password" ?hidden=${!locked}>Password of its key
+                    <input type="password" name="issuerKeyPassword" autocomplete="off" ?disabled=${!locked} ?required=${locked} />
+                    <span class="hint">The key of '${chosen?.commonName ?? ''}' has a password, and signs nothing without it.</span>
+                </label>
             `;
+
+        }
+
+        /** A password for a key, and the same again: optional, and empty for none. */
+        function newPasswordFields(Hint: string, Label = 'Password of its key'): TemplateResult {
+            return html`
+                <div class="key-password-fields">
+                    <label>${Label}
+                        <input type="password" name="newPassword" minlength="${current?.minKeyPasswordLength ?? 8}" autocomplete="new-password" />
+                        <span class="hint">
+                            Optional; ${current?.minKeyPasswordLength ?? 8} characters at least. ${Hint}
+                            The PKI keeps no password: one that is forgotten makes the key useless.
+                        </span>
+                    </label>
+                    <label>The password again
+                        <input type="password" name="newPasswordAgain" autocomplete="new-password" />
+                    </label>
+                </div>
+            `;
+        }
+
+        /**
+         * The password a form gives a key: null for none - or undefined, and
+         * said beside the form, where the two typed are not the same.
+         */
+        function newPasswordOf(Form: HTMLFormElement, Id: string): string | null | undefined {
+
+            const password = field(Form, 'newPassword', false);
+
+            if (password !== field(Form, 'newPasswordAgain', false)) {
+                must<HTMLElement>(content, `#${Id}-error`).textContent = 'The two passwords are not the same.';
+                return undefined;
+            }
+
+            return password.length > 0 ? password : null;
+
+        }
+
+        /** The password of the key of the CA that signs, where the form asks for it. */
+        function issuerPasswordOf(Form: HTMLFormElement): string | null {
+            const password = field(Form, 'issuerKeyPassword', false);
+            return password.length > 0 ? password : null;
         }
 
         /** What a form says where there is nothing to sign with yet. */
@@ -576,6 +708,8 @@ export const pkiPage: Page = {
                 const created = await whileSaving(content, must<HTMLElement>(content, `#${Id}-note`), Doing);
 
                 Form.reset();
+
+                delete issuerChosen[Id];
 
                 made            = Words(created);
                 openId          = created.id;
@@ -623,6 +757,7 @@ export const pkiPage: Page = {
                         ${keyField(pki, 'ecc-p384')}
                         ${validityField(pki, 3650, 'Ten years is usual for a root; nothing below it may outlive it.')}
                         ${pathLengthField('', 'How many sub-CAs may stand below it, one below the other. Empty for any number.')}
+                        ${newPasswordFields('Without one, whoever can read the directory of this PKI can sign as this root.')}
                         ${formActions('root-ca', 'Make the root CA')}
                     </form>
 
@@ -634,7 +769,11 @@ export const pkiPage: Page = {
 
             event.preventDefault();
 
-            const form = event.currentTarget as HTMLFormElement;
+            const form         = event.currentTarget as HTMLFormElement;
+            const keyPassword  = newPasswordOf(form, 'root-ca');
+
+            if (keyPassword === undefined)
+                return;
 
             // Read before the form is held still: a disabled field is no
             // field of the form any more.
@@ -642,7 +781,8 @@ export const pkiPage: Page = {
                 subject:       subjectOf(form),
                 keyAlgorithm:  field(form, 'keyAlgorithm'),
                 validDays:     numberField(form, 'validDays'),
-                pathLength:    field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength')
+                pathLength:    field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength'),
+                keyPassword
             };
 
             void make(form, 'root-ca', () => api.pki.rootCA(request),
@@ -668,11 +808,12 @@ export const pkiPage: Page = {
 
                     ${noSigner(pki, true) ?? html`
                         <form id="sub-ca-form" class="form-stack" @submit=${onSubCA}>
-                            ${issuerField(pki, true)}
+                            ${issuerField(pki, true, 'sub-ca')}
                             ${subjectFields()}
                             ${keyField(pki, 'ecc-p384')}
                             ${validityField(pki, 1825, 'No longer than the CA that signs it.')}
                             ${pathLengthField('0', '0 lets it sign certificates for servers and clients and no CA; empty, as many as its CA allows.')}
+                            ${newPasswordFields('Without one, whoever can read the directory of this PKI can sign as this sub-CA.')}
                             ${formActions('sub-ca', 'Make the sub-CA')}
                         </form>
                     `}
@@ -685,14 +826,20 @@ export const pkiPage: Page = {
 
             event.preventDefault();
 
-            const form = event.currentTarget as HTMLFormElement;
+            const form         = event.currentTarget as HTMLFormElement;
+            const keyPassword  = newPasswordOf(form, 'sub-ca');
+
+            if (keyPassword === undefined)
+                return;
 
             const request = {
-                issuer:        field(form, 'issuer'),
-                subject:       subjectOf(form),
-                keyAlgorithm:  field(form, 'keyAlgorithm'),
-                validDays:     numberField(form, 'validDays'),
-                pathLength:    field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength')
+                issuer:             field(form, 'issuer'),
+                issuerKeyPassword:  issuerPasswordOf(form),
+                subject:            subjectOf(form),
+                keyAlgorithm:       field(form, 'keyAlgorithm'),
+                validDays:          numberField(form, 'validDays'),
+                pathLength:         field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength'),
+                keyPassword
             };
 
             void make(form, 'sub-ca', () => api.pki.subCA(request),
@@ -719,7 +866,7 @@ export const pkiPage: Page = {
 
                     ${noSigner(pki, false) ?? html`
                         <form id="issue-form" class="form-stack" @submit=${onIssue}>
-                            ${issuerField(pki, false)}
+                            ${issuerField(pki, false, 'issue')}
                             <label>For
                                 <select name="profile">
                                     <option value="server">a server (TLS server authentication)</option>
@@ -736,6 +883,7 @@ export const pkiPage: Page = {
                             </label>
                             ${keyField(pki, 'ecc-p256')}
                             ${validityField(pki, 365, 'No longer than the CA that signs it.')}
+                            ${newPasswordFields('With one, the key is downloaded encrypted, and whatever opens it asks for it.')}
                             ${formActions('issue', 'Make the certificate')}
                         </form>
                     `}
@@ -748,10 +896,16 @@ export const pkiPage: Page = {
 
             event.preventDefault();
 
-            const form = event.currentTarget as HTMLFormElement;
+            const form         = event.currentTarget as HTMLFormElement;
+            const keyPassword  = newPasswordOf(form, 'issue');
+
+            if (keyPassword === undefined)
+                return;
 
             const request = {
                 issuer:                   field(form, 'issuer'),
+                issuerKeyPassword:        issuerPasswordOf(form),
+                keyPassword,
                 profile:                  field(form, 'profile') as 'server' | 'client',
                 subject:                  subjectOf(form),
                 keyAlgorithm:             field(form, 'keyAlgorithm'),
@@ -784,7 +938,7 @@ export const pkiPage: Page = {
                     ${noSigner(pki, false) ?? html`
                         <form id="csr-form" class="form-stack" @submit=${onCSR}>
 
-                            ${issuerField(pki, false)}
+                            ${issuerField(pki, false, 'csr')}
 
                             <label>Sign it as
                                 <select name="profile">
@@ -908,6 +1062,7 @@ export const pkiPage: Page = {
 
             const request = {
                 issuer:                       field(form, 'issuer'),
+                issuerKeyPassword:            issuerPasswordOf(form),
                 profile:                      field(form, 'profile') as 'subCA' | 'server' | 'client',
                 csr:                          field(form, 'csr'),
                 validDays:                    numberField(form, 'validDays'),
