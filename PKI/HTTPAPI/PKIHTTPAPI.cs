@@ -58,6 +58,7 @@ namespace cloud.charging.open.PKI
     /// | <c>POST v1/pki/rootCAs</c>, <c>POST v1/pki/subCAs</c> | a new root CA, a new sub-CA below a CA |
     /// | <c>POST v1/pki/certificates</c> | a new server or client certificate below a CA, with a key made here |
     /// | <c>POST v1/pki/csr</c>, <c>POST v1/pki/csr/inspect</c> | a certificate for the key of a CSR, and what a CSR says before that |
+    /// | <c>v1/pki/transparency</c> | the certificate transparency log, and below it what RFC 6962 has a log answer - see PKIHTTPAPI.Transparency.cs |
     /// </para>
     /// <para>
     /// A private key may have a password - "keyPassword" where it is made -
@@ -71,7 +72,7 @@ namespace cloud.charging.open.PKI
     /// node lets in every request.
     /// </para>
     /// </remarks>
-    public class PKIHTTPAPI : NodeHTTPAPI
+    public partial class PKIHTTPAPI : NodeHTTPAPI
     {
 
         #region Properties
@@ -142,6 +143,8 @@ namespace cloud.charging.open.PKI
 
             AddHandler(root + "/csr",                    PostCSR,             HTTPMethod.POST);
             AddHandler(root + "/csr/inspect",            PostCSRInspect,      HTTPMethod.POST);
+
+            RegisterTransparencyURLTemplates();
 
         }
 
@@ -683,6 +686,7 @@ namespace cloud.charging.open.PKI
                                                                )))));
             json.Add(new JProperty("issuedCount",  PKI.Store.IssuedBy(Certificate.Id).Count));
             json.Add(new JProperty("belowCount",   Below(Certificate.Id).Count));
+            json.Add(new JProperty("transparency", TransparencyJSON(Certificate)));
 
             // Said rather than left to the page to work out: the key of a CA
             // is never handed out, whoever asks.

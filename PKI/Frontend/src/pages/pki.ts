@@ -1,10 +1,13 @@
 import { api,
+         apiURL,
          type CertificateProfile,
          type CSRInspection,
+         type LogEntry,
          type PKICertificate,
          type PKICertificateDetails,
          type PKICertificates,
-         type SubjectName }  from '../api/client';
+         type SubjectName,
+         type TransparencyLog }  from '../api/client';
 import { auth } from '../auth';
 import { must } from '@node/html';
 import { appendText, pemBox } from '@node/pemBox';
@@ -25,6 +28,10 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  * form ends in: whatever is made is opened in it at once, and what is typed
  * into one form is still there after a look at the list. Each form is a draft
  * the page holds until it is sent; the filter is none.
+ *
+ * Beside them, the transparency log: every certificate the PKI signed, in the
+ * order it signed them - a deleted one too - with the address a monitor reads
+ * it at, and what the log signed last.
  *
  * A key made here may be given a password, and need not. A CA whose key has
  * one signs only where its password is given again, so a form shows the field
@@ -58,6 +65,9 @@ function moment(Iso: string): string {
     const date = new Date(Iso);
     return Number.isNaN(date.getTime()) ? Iso : date.toLocaleString();
 }
+
+/** How many entries of the log are shown at first, and how many more each time. */
+const logPage = 50;
 
 /** A fingerprint in pairs, as openssl and a browser show one. */
 function inPairs(Id: string): string {
@@ -132,10 +142,11 @@ export const pkiPage: Page = {
             { id: 'root-ca',       label: 'New root CA',      icon: 'fa-crown'          },
             { id: 'sub-ca',        label: 'New sub-CA',       icon: 'fa-sitemap'        },
             { id: 'issue',         label: 'New certificate',  icon: 'fa-file-signature' },
-            { id: 'csr',           label: 'Sign a CSR',       icon: 'fa-file-import'    }
+            { id: 'csr',           label: 'Sign a CSR',       icon: 'fa-file-import'    },
+            { id: 'transparency',  label: 'Transparency log', icon: 'fa-scroll'         }
         ];
 
-        const tabs = allTabs.filter(tab => tab.id === 'certificates'
+        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency'
                                         || ((tab.id === 'root-ca' || tab.id === 'sub-ca') && mayMakeCAs)
                                         ||  (tab.id === 'issue'                          && maySign)
                                         ||  (tab.id === 'csr'                            && (maySign || mayMakeCAs)));
@@ -160,6 +171,12 @@ export const pkiPage: Page = {
         /** What the last form made, said above the list it was opened in. */
         let made                                           = '';
 
+        /** The transparency log, the entries of it shown - the newest first - and how many. */
+        let log:            TransparencyLog | null         = null;
+        let logEntries:     LogEntry[]                     = [];
+        let logShown                                       = logPage;
+        let logProblem                                     = '';
+
         /** The CA each form has chosen to sign, by the id of the form; its first where none was. */
         const issuerChosen: Record<string, string> = {};
 
@@ -169,11 +186,13 @@ export const pkiPage: Page = {
         let csrTimer:       ReturnType<typeof setTimeout> | undefined;
 
 
-        /** Show another tab, and keep it in the address. */
+        /** Show another tab, and keep it in the address - and read the log, where it is the log's. */
         function show(id: string): void {
             shown = id;
             rememberTab(tabs, id);
             draw();
+            if (id === 'transparency')
+                void loadLog();
         }
 
         /** Every certificate, or those the filter lets through. */
@@ -236,6 +255,10 @@ export const pkiPage: Page = {
                     <section class="tab-panel" role="tabpanel" id="panel-csr" aria-labelledby="tab-csr" ?hidden=${shown !== 'csr'}>
                         ${csrView(pki)}
                     </section>` : nothing}
+
+                <section class="tab-panel" role="tabpanel" id="panel-transparency" aria-labelledby="tab-transparency" ?hidden=${shown !== 'transparency'}>
+                    ${transparencyView()}
+                </section>
 
             `);
 
@@ -355,6 +378,9 @@ export const pkiPage: Page = {
                         <div class="kv"><span class="k">Signed</span><span class="v">${certificate.issuedCount} certificate(s), ${certificate.belowCount} below it in all</span></div>` : nothing}
                     <div class="kv"><span class="k">Serial number</span><span class="v"><code>${certificate.serialNumber}</code></span></div>
                     <div class="kv"><span class="k">SHA-256</span><span class="v fingerprint">${inPairs(certificate.id)}</span></div>
+                    <div class="kv"><span class="k">Transparency log</span><span class="v" id="pki-details-log">${certificate.transparency
+                        ? html`entry #${certificate.transparency.index}, since ${moment(certificate.transparency.loggedAt)}`
+                        : html`<span class="muted">not in it</span>`}</span></div>
                     <div class="kv"><span class="k">Made</span><span class="v">${moment(certificate.createdAt)}${certificate.createdBy !== null ? ` by ${certificate.createdBy}` : ''}</span></div>
 
                     <div class="pki-actions">
@@ -1078,6 +1104,131 @@ export const pkiPage: Page = {
 
 
         // ------------------------------------------------------------------
+        // The transparency log
+        // ------------------------------------------------------------------
+
+        /** Where a monitor reads the log: the base RFC 6962 puts "/ct/v1/get-sth" and the rest below. */
+        function logAddress(): string {
+            return new URL(apiURL('/pki/transparency'), location.href).href;
+        }
+
+        function transparencyView(): TemplateResult {
+
+            if (logProblem.length > 0)
+                return html`<div class="error-box">${logProblem}</div>`;
+
+            if (log === null)
+                return html`<div class="loading">Loading ...</div>`;
+
+            const theLog  = log;
+            const first   = logEntries.length > 0 ? logEntries[logEntries.length - 1]!.index : 0;
+
+            return html`
+                <section class="card" id="pki-transparency">
+
+                    <h2><i class="fa-solid fa-scroll"></i> Transparency log</h2>
+
+                    <p class="hint">
+                        Every certificate this PKI signed, in the order it signed them, in a Merkle tree whose head
+                        the log signs - as RFC 6962 has a certificate transparency log do it. Nothing is ever taken
+                        out of it: a certificate deleted from the PKI stays in its log. A monitor reads it at the
+                        address below, signed in with an API key of an account that may look at the certificates.
+                    </p>
+
+                    ${theLog.broken ? html`
+                        <div class="error-box" id="pki-transparency-broken">
+                            The log is broken, and the PKI signs nothing until it is repaired: ${theLog.problems.join(' ')}
+                        </div>` : theLog.problems.length > 0 ? html`
+                        <div class="notice">${theLog.problems.join(' ')}</div>` : nothing}
+
+                    <div class="kv"><span class="k">Address</span><span class="v"><code id="pki-transparency-address">${logAddress()}</code></span></div>
+                    <div class="kv"><span class="k">Log ID</span><span class="v fingerprint">${theLog.logId}</span></div>
+                    <div class="kv"><span class="k">Certificates</span><span class="v">${theLog.treeSize}</span></div>
+                    ${theLog.sth !== null ? html`
+                        <div class="kv"><span class="k">Newest tree head</span><span class="v">
+                            ${theLog.sth.tree_size} certificate(s), signed ${theLog.signedAt !== null ? moment(theLog.signedAt) : ''}
+                        </span></div>
+                        <div class="kv"><span class="k">Root hash</span><span class="v fingerprint">${theLog.sth.sha256_root_hash}</span></div>` : nothing}
+
+                    <div class="pki-actions">
+                        <button type="button" class="btn small" id="pki-transparency-copy-address"
+                                @click=${(event: Event) => void copyLog(event.currentTarget as HTMLButtonElement, logAddress())}>
+                            <i class="fa-solid fa-copy"></i> Copy the address
+                        </button>
+                        <button type="button" class="btn small" id="pki-transparency-download-key"
+                                @click=${() => download('transparency-log.pub.pem', theLog.publicKey)}>
+                            <i class="fa-solid fa-download"></i> Public key
+                        </button>
+                        <span class="form-notice" role="status" id="pki-transparency-note"></span>
+                    </div>
+
+                    ${logEntries.length === 0
+                          ? html`<p class="hint">The log has no certificate yet.</p>`
+                          : html`
+                              <div class="table-scroll">
+                                <table class="records pki-log">
+                                    <thead><tr><th>#</th><th>Logged</th><th>Profile</th><th>Common name</th><th>In the PKI</th></tr></thead>
+                                    <tbody>
+                                        ${repeat(logEntries, entry => entry.index, entry => html`
+                                            <tr data-index="${entry.index}" class="${entry.inPKI ? 'clickable' : ''}"
+                                                @click=${() => { if (entry.inPKI) { show('certificates'); void open(entry.id); } }}>
+                                                <td>${entry.index}</td>
+                                                <td>${moment(entry.loggedAt)}</td>
+                                                <td><span class="chip">${profileWords[entry.profile]}</span></td>
+                                                <td class="common-name">${entry.commonName}</td>
+                                                <td>${entry.inPKI ? html`<span class="chip ok">yes</span>` : html`<span class="chip warn">deleted</span>`}</td>
+                                            </tr>
+                                        `)}
+                                    </tbody>
+                                </table>
+                              </div>
+                              ${first > 0 ? html`
+                                  <button type="button" class="btn small" id="pki-transparency-older" @click=${() => { logShown += logPage; void loadLog(); }}>
+                                      Show older
+                                  </button>` : nothing}
+                          `}
+
+                </section>
+            `;
+
+        }
+
+        async function copyLog(Button: HTMLButtonElement, Text: string): Promise<void> {
+            must<HTMLElement>(content, '#pki-transparency-note').textContent = await copyText(Text);
+            Button.blur();
+        }
+
+        /** The log, and its newest entries - as many as are shown - the newest first. */
+        async function loadLog(): Promise<void> {
+
+            try
+            {
+
+                const loaded  = await api.pki.transparency();
+                const start   = Math.max(0, loaded.treeSize - logShown);
+                const listed  = loaded.treeSize > 0 ? (await api.pki.logEntries(start, loaded.treeSize - 1)).entries : [];
+
+                if (cancelled)
+                    return;
+
+                log         = loaded;
+                logEntries  = [ ...listed ].reverse();
+                logProblem  = '';
+
+            }
+            catch (problem)
+            {
+                if (cancelled)
+                    return;
+                logProblem = `The transparency log could not be loaded: ${errorMessage(problem)}`;
+            }
+
+            draw();
+
+        }
+
+
+        // ------------------------------------------------------------------
         // Loading
         // ------------------------------------------------------------------
 
@@ -1101,6 +1252,9 @@ export const pkiPage: Page = {
                 }
 
                 draw();
+
+                if (shown === 'transparency')
+                    void loadLog();
 
             }
             catch (problem)

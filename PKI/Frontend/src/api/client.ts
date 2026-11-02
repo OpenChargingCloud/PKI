@@ -106,6 +106,61 @@ export interface PKICertificateDetails extends PKICertificate {
     belowCount:             number;
     /** Whether whoever is signed in may have its key: never a CA's. */
     mayDownloadPrivateKey:  boolean;
+    /** Where it is in the transparency log of the PKI; null where the log does not have it. */
+    transparency:           CertificateInTheLog | null;
+}
+
+/** A signed certificate timestamp, as RFC 6962 writes one: the log's id and signature in Base64. */
+export interface SignedCertificateTimestamp {
+    sct_version:  number;
+    id:           string;
+    timestamp:    number;
+    extensions:   string;
+    signature:    string;
+}
+
+/** Where a certificate is in the transparency log, since when, and the log's word for it. */
+export interface CertificateInTheLog {
+    index:     number;
+    loggedAt:  string;
+    sct:       SignedCertificateTimestamp;
+}
+
+/** A signed tree head, as get-sth of RFC 6962 answers it. */
+export interface SignedTreeHead {
+    tree_size:            number;
+    timestamp:            number;
+    sha256_root_hash:     string;
+    tree_head_signature:  string;
+}
+
+/** The transparency log of the PKI: who it is, how big, its newest tree head - and what is wrong with it. */
+export interface TransparencyLog {
+    logId:              string;
+    publicKey:          string;
+    treeSize:           number;
+    /** None where the log is broken: it signs nothing then. */
+    sth:                SignedTreeHead | null;
+    signedAt:           string | null;
+    maximumMergeDelay:  number;
+    broken:             boolean;
+    problems:           string[];
+    directory:          string;
+}
+
+/** One entry of the log, as its list shows it - read from the certificate, which the PKI may not have any more. */
+export interface LogEntry {
+    index:       number;
+    timestamp:   number;
+    loggedAt:    string;
+    id:          string;
+    commonName:  string;
+    subject:     string;
+    issuer:      string;
+    profile:     CertificateProfile;
+    notAfter:    string;
+    /** Whether the PKI still has it: a deleted one stays in the log. */
+    inPKI:       boolean;
 }
 
 /** Every certificate of the PKI, and what it makes new ones with. */
@@ -206,7 +261,9 @@ export const api = {
         subCA:       (ca: NewSubCA)                    => request<PKICertificateDetails> ('POST',   '/pki/subCAs',       ca),
         issue:       (certificate: NewCertificate)     => request<PKICertificateDetails> ('POST',   '/pki/certificates', certificate),
         signCSR:     (signing: CSRSigning)             => request<PKICertificateDetails> ('POST',   '/pki/csr',          signing),
-        inspectCSR:  (csr: string)                     => request<CSRInspection>         ('POST',   '/pki/csr/inspect',  { csr })
+        inspectCSR:  (csr: string)                     => request<CSRInspection>         ('POST',   '/pki/csr/inspect',  { csr }),
+        transparency: ()                               => request<TransparencyLog>       ('GET',    '/pki/transparency'),
+        logEntries:  (start: number, end: number)      => request<{ treeSize: number; entries: LogEntry[] }>('GET', `/pki/transparency/entries?start=${start}&end=${end}`)
     }
 
 };

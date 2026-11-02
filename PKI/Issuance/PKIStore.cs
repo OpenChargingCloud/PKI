@@ -25,6 +25,8 @@ using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
+using cloud.charging.open.PKI.Transparency;
+
 #endregion
 
 namespace cloud.charging.open.PKI.Issuance
@@ -83,6 +85,13 @@ namespace cloud.charging.open.PKI.Issuance
     /// can sign as every CA in it whose key has no password.
     /// </para>
     /// <para>
+    /// Beside them, in "transparency", the certificate transparency log of
+    /// the PKI - see <see cref="TransparencyLog"/>. Every certificate is
+    /// written to it before it is kept anywhere else, so that there is none
+    /// the log does not have; a certificate the log could not take is not
+    /// kept, and a deleted one stays in the log.
+    /// </para>
+    /// <para>
     /// Everything that changes the store does so under one lock, and writes
     /// the index through a temporary file moved into place, so that a
     /// process dying mid-write leaves the old index behind and not half of
@@ -99,6 +108,12 @@ namespace cloud.charging.open.PKI.Issuance
         /// The name of the index beside the certificates.
         /// </summary>
         public const   String  IndexFileName       = "index.json";
+
+        /// <summary>
+        /// The name of the directory of the transparency log, beside the
+        /// certificates.
+        /// </summary>
+        public const   String  TransparencyDirectory  = "transparency";
 
         /// <summary>
         /// The longest a certificate may be made for: a hundred years, which
@@ -155,6 +170,19 @@ namespace cloud.charging.open.PKI.Issuance
         /// said in a sentence, for the log.
         /// </summary>
         public IReadOnlyList<String>   PassedOver   { get; }
+
+        /// <summary>
+        /// The certificate transparency log of this PKI: every certificate it
+        /// signed, deleted or not.
+        /// </summary>
+        public TransparencyLog         Transparency            { get; }
+
+        /// <summary>
+        /// How many certificates of the store the log did not have when it was
+        /// read, and took in then: every one of them, where the log was made
+        /// at that start.
+        /// </summary>
+        public Int32                   TakenIntoTheLog         { get; }
 
         /// <summary>
         /// How many certificates are in it.
@@ -242,6 +270,51 @@ namespace cloud.charging.open.PKI.Issuance
                 }
 
             }
+
+            #region The transparency log, with every certificate of the store in it
+
+            Transparency = new TransparencyLog(Path.Combine(this.Directory, TransparencyDirectory), this.timeProvider);
+
+            foreach (var problem in Transparency.Problems)
+                passedOver.Add($"Transparency log: {problem}");
+
+            // Those it does not have yet - all of them, where the log is new
+            // - in the order they were made, so that a CA is in it before
+            // what it signed.
+            var notInTheLog = certificates.Values.
+                                           Where  (certificate => Transparency.Find(certificate.Id) is null).
+                                           OrderBy(certificate => certificate.CreatedAt).
+                                           ToList();
+
+            foreach (var certificate in notInTheLog)
+            {
+
+                using var x509   = Load(certificate.Id)!;
+                var chain        = ChainCertificates(certificate.IssuerId);
+
+                try
+                {
+                    if (!Transparency.TryAppend(x509, chain, out _, out var error))
+                    {
+                        passedOver.Add($"Transparency log: the {certificate.Profile.InWords()} '{certificate.CommonName}' ({certificate.Id}) is not in it - {error}");
+                        break;
+                    }
+                }
+                finally
+                {
+                    foreach (var one in chain)
+                        one.Dispose();
+                }
+
+                TakenIntoTheLog++;
+
+            }
+
+            if (TakenIntoTheLog > 0 && !Transparency.IsNew)
+                passedOver.Add($"Transparency log: {TakenIntoTheLog} certificate(s) of the store were not in it, and were taken in now - " +
+                                "with the time of this start, not the time they were made.");
+
+            #endregion
 
             PassedOver = passedOver;
 
@@ -1047,6 +1120,27 @@ namespace cloud.charging.open.PKI.Issuance
                     return false;
                 }
 
+                // In the log before it is anywhere else: a certificate the log
+                // could not take is not kept, and one the log took and the
+                // disk then refused is in the log all the same - it was
+                // signed, which is what the log says.
+                var chain = ChainCertificates(IssuerId);
+
+                try
+                {
+                    if (!Transparency.TryAppend(Certificate, chain, out _, out var logError))
+                    {
+                        NotSaved = true;
+                        Error    = $"Nothing was kept: {logError}";
+                        return false;
+                    }
+                }
+                finally
+                {
+                    foreach (var one in chain)
+                        one.Dispose();
+                }
+
                 var written = new List<String>();
 
                 try
@@ -1446,6 +1540,20 @@ namespace cloud.charging.open.PKI.Issuance
             => Profile == CertificateProfile.Server && AlternativeNames.Count == 0 && Issuance.AlternativeNames.LooksLikeAHostName(CommonName)
                    ? [ CommonName ]
                    : AlternativeNames;
+
+        #endregion
+
+        #region (private) ChainCertificates(IssuerId)
+
+        /// <summary>
+        /// The CA of the given id and every one above it up to its root, read
+        /// from their files: what the log is told of a certificate's chain.
+        /// </summary>
+        private List<X509Certificate2> ChainCertificates(String? IssuerId)
+
+            => IssuerId is null
+                   ? []
+                   : Chain(IssuerId).Select(one => Load(one.Id)).OfType<X509Certificate2>().ToList();
 
         #endregion
 

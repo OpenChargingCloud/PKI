@@ -431,6 +431,143 @@ namespace cloud.charging.open.PKI.Tests
 
         #endregion
 
+        #region AMonitorChecksTheTransparencyLogAsRFC6962Says()
+
+        /// <summary>
+        /// What a monitor does with the log, over the API and with the public
+        /// key the log says it has: the signed tree head checked, every entry
+        /// proved in it by the hash of its leaf, the tree proved to have grown
+        /// from the one before - and a certificate deleted from the PKI still
+        /// in its log.
+        /// </summary>
+        [Test]
+        public async Task AMonitorChecksTheTransparencyLogAsRFC6962Says()
+        {
+
+            await TestPorts.StartedOnFreshPorts(PKIFrom);
+
+            using var admin     = await SignedInAs("admin3",    "systemadmin");
+            using var operator_ = await SignedInAs("operator3", "operator");
+
+            const String ct = "api/v1/pki/transparency/ct/v1";
+
+            var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new { subject = new { commonName = "CT Root" } });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), root.ToString());
+
+            (status, var first) = await Get(operator_, $"{ct}/get-sth");
+            Assert.That(status, Is.EqualTo(HttpStatusCode.OK), first.ToString());
+
+            for (var i = 1; i <= 3; i++)
+            {
+                (status, var made) = await Post(admin, "api/v1/pki/certificates", new {
+                                         issuer   = root["id"]!.Value<String>(),
+                                         profile  = "client",
+                                         subject  = new { commonName = $"CS-{i:D4}" }
+                                     });
+                Assert.That(status, Is.EqualTo(HttpStatusCode.Created), made.ToString());
+                Assert.That(made["transparency"]!["index"]!.Value<Int64>(), Is.EqualTo(i));
+            }
+
+            #region The log, and its newest tree head checked with its key
+
+            (status, var log) = await Get(operator_, "api/v1/pki/transparency");
+
+            Assert.That(status,                                Is.EqualTo(HttpStatusCode.OK), log.ToString());
+            Assert.That(log["broken"]!.Value<Boolean>(),       Is.False);
+            Assert.That(log["treeSize"]!.Value<Int64>(),       Is.EqualTo(4));
+
+            using var publicKey = ECDsa.Create();
+            publicKey.ImportFromPem(log["publicKey"]!.Value<String>());
+
+            (status, var sth) = await Get(operator_, $"{ct}/get-sth");
+
+            var treeSize  = sth["tree_size"]!.Value<Int64>();
+            var rootHash  = Convert.FromBase64String(sth["sha256_root_hash"]!.Value<String>()!);
+            var signature = Convert.FromBase64String(sth["tree_head_signature"]!.Value<String>()!);
+
+            Byte[] signed = [ 0, 1, .. BigEndian(sth["timestamp"]!.Value<Int64>()), .. BigEndian(treeSize), .. rootHash ];
+
+            Assert.That(treeSize, Is.EqualTo(4));
+            Assert.That(publicKey.VerifyData(signed, signature[4..], HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence), Is.True);
+
+            #endregion
+
+            #region Every entry proved in it by the hash of its leaf
+
+            (status, var entries) = await Get(operator_, $"{ct}/get-entries?start=0&end=99");
+
+            Assert.That(entries["entries"]!.Count(), Is.EqualTo(4), "as many as there are");
+
+            foreach (var (entry, index) in entries["entries"]!.Select((entry, index) => (entry, index)))
+            {
+
+                var leafHash = Transparency.MerkleTree.LeafHash(Convert.FromBase64String(entry["leaf_input"]!.Value<String>()!));
+
+                (status, var proof) = await Get(operator_, $"{ct}/get-proof-by-hash?hash={Uri.EscapeDataString(Convert.ToBase64String(leafHash))}&tree_size={treeSize}");
+
+                Assert.That(status,                                Is.EqualTo(HttpStatusCode.OK), proof.ToString());
+                Assert.That(proof["leaf_index"]!.Value<Int64>(),   Is.EqualTo(index));
+                Assert.That(Transparency.MerkleTree.VerifyInclusion(leafHash, index, treeSize,
+                                                                    proof["audit_path"]!.Select(hash => Convert.FromBase64String(hash.Value<String>()!)).ToList(),
+                                                                    rootHash), Is.True, $"entry {index}");
+
+            }
+
+            #endregion
+
+            #region The tree grew from the one before, and nothing else
+
+            var firstSize  = first["tree_size"]!.Value<Int64>();
+            var firstHash  = Convert.FromBase64String(first["sha256_root_hash"]!.Value<String>()!);
+
+            (status, var consistency) = await Get(operator_, $"{ct}/get-sth-consistency?first={firstSize}&second={treeSize}");
+
+            Assert.That(status, Is.EqualTo(HttpStatusCode.OK), consistency.ToString());
+            Assert.That(Transparency.MerkleTree.VerifyConsistency(firstSize, treeSize, firstHash, rootHash,
+                                                                  consistency["consistency"]!.Select(hash => Convert.FromBase64String(hash.Value<String>()!)).ToList()), Is.True);
+
+            #endregion
+
+            #region The roots, and a certificate deleted and still in the log
+
+            (status, var roots) = await Get(operator_, $"{ct}/get-roots");
+
+            Assert.That(roots["certificates"]!.Count(), Is.EqualTo(1));
+
+            (status, var listed) = await Get(operator_, "api/v1/pki/transparency/entries?start=0&end=3");
+            var lastId           = listed["entries"]![3]!["id"]!.Value<String>();
+
+            (status, _) = await Delete(admin, $"api/v1/pki/certificates/{lastId}");
+            Assert.That(status, Is.EqualTo(HttpStatusCode.OK));
+
+            (status, listed) = await Get(operator_, "api/v1/pki/transparency/entries?start=0&end=3");
+
+            Assert.That(listed["entries"]!.Count(),                       Is.EqualTo(4));
+            Assert.That(listed["entries"]![3]!["inPKI"]!.Value<Boolean>(), Is.False);
+            Assert.That(listed["entries"]![3]!["commonName"]!.Value<String>(), Is.EqualTo("CS-0003"));
+            Assert.That(listed["entries"]![3]!["profile"]!.Value<String>(),    Is.EqualTo("client"));
+
+            #endregion
+
+            #region Nobody signed in reads nothing of it
+
+            using var anybody = new HttpClient { BaseAddress = address, Timeout = TimeSpan.FromSeconds(30) };
+
+            Assert.That((await anybody.GetAsync($"{ct}/get-sth")).StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized));
+
+            #endregion
+
+        }
+
+        private static Byte[] BigEndian(Int64 Value)
+        {
+            var bytes = new Byte[8];
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(bytes, Value);
+            return bytes;
+        }
+
+        #endregion
+
         [Test]
         public async Task AnOperatorLooksAndSignsNothing()
         {

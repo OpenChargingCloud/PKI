@@ -240,6 +240,19 @@ namespace cloud.charging.open.PKI
             foreach (var passedOver in Store.PassedOver)
                 this.Log.Warning($"PKI: {passedOver}", "pki", "security");
 
+            // A broken log stops the PKI from signing: said as loudly as the
+            // log can say it.
+            if (Store.Transparency.IsBroken)
+                this.Log.Error($"The transparency log in '{Store.Transparency.Directory}' is broken, and the PKI signs nothing until it is repaired.",
+                               "pki", "security");
+
+            else
+                this.Log.Info($"The transparency log of the PKI has {Store.Transparency.Count} certificate(s), " +
+                              (Store.Transparency.IsNew && Store.TakenIntoTheLog > 0
+                                   ? $"every one of the store's, taken in now that it was made; its id is {Convert.ToBase64String(Store.Transparency.LogId)}."
+                                   : $"its id is {Convert.ToBase64String(Store.Transparency.LogId)}."),
+                              "pki", "security");
+
             // What whoever can read the directory can sign as: every CA whose
             // key has no password.
             var caKeys       = Store.Find().Where(certificate => certificate.Profile.IsCA() && certificate.HasPrivateKey).ToList();
@@ -333,7 +346,11 @@ namespace cloud.charging.open.PKI
                               new JProperty("clients",        all.Count(certificate => certificate.Profile == CertificateProfile.Client)),
                               new JProperty("keys",           all.Count(certificate => certificate.HasPrivateKey)),
                               new JProperty("keysWithPassword",
-                                                              all.Count(certificate => certificate.HasPrivateKey && certificate.KeyEncrypted))
+                                                              all.Count(certificate => certificate.HasPrivateKey && certificate.KeyEncrypted)),
+                              new JProperty("transparencyLog",
+                                                              Store.Transparency.IsBroken
+                                                                  ? "broken"
+                                                                  : $"{Store.Transparency.Count} certificate(s)")
                           )));
 
             return json;

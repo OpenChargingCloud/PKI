@@ -28,8 +28,18 @@ function certificate(id: string, commonName: string, profile: string, issuerId: 
 function detailed(found: Record<string, unknown>): Record<string, unknown> {
     return { ...found, pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', chainPem: '',
              chain: [ { id: found['id'], commonName: found['commonName'], profile: found['profile'] } ],
-             issuedCount: 0, belowCount: 0, mayDownloadPrivateKey: false };
+             issuedCount: 0, belowCount: 0, mayDownloadPrivateKey: false,
+             transparency: { index: 0, loggedAt: '2026-01-01T00:00:00Z',
+                             sct: { sct_version: 0, id: 'bG9n', timestamp: 0, extensions: '', signature: 'c2ln' } } };
 }
+
+/** The entries of the stand-in log: what the PKI signed, one of them deleted since. */
+const logged = [
+    { index: 0, timestamp: 0, loggedAt: '2026-01-01T00:00:00Z', id: 'aa', commonName: 'OCC Root CA', subject: 'CN=OCC Root CA', issuer: 'CN=OCC Root CA',
+      profile: 'rootCA', notAfter: '2036-01-01T00:00:00Z', inPKI: true },
+    { index: 1, timestamp: 0, loggedAt: '2026-01-02T00:00:00Z', id: 'ee', commonName: 'CS-0009',     subject: 'CN=CS-0009',     issuer: 'CN=OCC Root CA',
+      profile: 'client', notAfter: '2027-01-01T00:00:00Z', inPKI: false }
+];
 
 let certificates: Record<string, unknown>[] = [];
 
@@ -38,6 +48,14 @@ function pki({ method, path, body }: Asked): unknown {
     if (method === 'GET' && path === '/pki/certificates')
         return { certificates, total: certificates.length, directory: '/srv/pki', maxValidityDays: 36500, minKeyPasswordLength: 8,
                  keyAlgorithms: [ 'ecc-p256', 'ecc-p384', 'ecc-p521', 'rsa-2048', 'rsa-3072', 'rsa-4096' ] };
+
+    if (method === 'GET' && path === '/pki/transparency')
+        return { logId: 'bG9nIGlk', publicKey: '-----BEGIN PUBLIC KEY-----\nMFk\n-----END PUBLIC KEY-----\n', treeSize: logged.length,
+                 sth: { tree_size: logged.length, timestamp: 0, sha256_root_hash: 'cm9vdA==', tree_head_signature: 'c2ln' },
+                 signedAt: '2026-01-02T00:00:00Z', maximumMergeDelay: 0, broken: false, problems: [], directory: '/srv/pki/transparency' };
+
+    if (method === 'GET' && path.startsWith('/pki/transparency/entries'))
+        return { treeSize: logged.length, entries: logged };
 
     const one = /^\/pki\/certificates\/([0-9a-f]+)$/.exec(path);
 
@@ -246,6 +264,33 @@ describe('the PKI page', () => {
 
     });
 
+    it('lists the transparency log, the newest first and a deleted certificate still in it', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null) ];
+
+        const root = await open(pkiPage, '/pki?tab=transparency', [ 'issuance:read' ], pki,
+                                root => root.querySelector('table.pki-log') !== null);
+
+        const rows = [ ...root.querySelectorAll<HTMLElement>('table.pki-log tbody tr') ];
+
+        assert.deepEqual(rows.map(row => row.dataset['index']), [ '1', '0' ], 'the newest first');
+        assert.match(rows[0]!.textContent!, /CS-0009/);
+        assert.match(rows[0]!.textContent!, /deleted/);
+        assert.match(root.querySelector('#pki-transparency-address')!.textContent!, /\/api\/v1\/pki\/transparency$/);
+        assert.match(root.querySelector('#pki-transparency')!.textContent!, /cm9vdA==/);
+        assert.ok(asked.some(one => one.method === 'GET' && one.path === '/pki/transparency/entries' &&
+                                    one.query.get('start') === '0' && one.query.get('end') === '1'), 'every entry there is, and no more');
+
+        // A row of a certificate the PKI still has opens it in the list.
+        rows[1]!.click();
+
+        await until(() => root.querySelector('#pki-details-log') !== null, 'the certificate was not opened from the log');
+
+        assert.match(root.querySelector('#pki-details-log')!.textContent!, /entry #0/);
+        assert.equal(root.querySelector('#panel-certificates')!.hasAttribute('hidden'), false);
+
+    });
+
     it('offers no form to an account that may sign nothing', async () => {
 
         certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null) ];
@@ -254,7 +299,8 @@ describe('the PKI page', () => {
                                 root => root.querySelector('table.pki-list') !== null);
 
         assert.equal(root.querySelector('form'), null);
-        assert.equal(root.querySelectorAll('[role="tab"]').length, 1);
+        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency' ],
+                         'the list, and the log, which is read as the list is');
         assert.match(root.querySelector('.notice')!.textContent!, /may look at the certificates of this PKI but not sign any/);
 
     });

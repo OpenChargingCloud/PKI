@@ -114,6 +114,20 @@ table.records.pki-list {
 
 }
 
+// The transparency log: a row opens its certificate where the PKI still has
+// it, and is only text where it was deleted.
+table.records.pki-log {
+
+    tbody tr.clickable {
+        cursor: pointer;
+    }
+
+    tbody tr.clickable:hover td {
+        background: $color-bg;
+    }
+
+}
+
 // What a CSR says, before it is signed.
 .csr-preview {
     border-left:   3px solid $color-accent;
