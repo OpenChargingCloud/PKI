@@ -385,7 +385,14 @@ namespace cloud.charging.open.PKI
                        new JProperty("issuer",      certificate.Issuer),
                        new JProperty("profile",     (kept?.Profile ?? ProfileOf(certificate)).AsText()),
                        new JProperty("notAfter",    new DateTimeOffset(certificate.NotAfter.ToUniversalTime(), TimeSpan.Zero).ToString("o", CultureInfo.InvariantCulture)),
-                       new JProperty("inPKI",       kept is not null)
+                       new JProperty("inPKI",       kept is not null),
+                       new JProperty("revoked",     PKI.Store.RevocationOf(Entry.CertificateId) is not null),
+
+                       // A responder of a CA is signed by the PKI and in its
+                       // log, but kept beside its CA rather than in the store.
+                       new JProperty("ocspResponder",
+                                                    certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>().FirstOrDefault()?.
+                                                                EnhancedKeyUsages.OfType<System.Security.Cryptography.Oid>().Any(usage => usage.Value == Revocation.OCSP.OCSPSigningOID) == true)
                    );
 
         }

@@ -38,6 +38,8 @@ namespace cloud.charging.open.PKI.Issuance
     ///
     /// Whether its key is encrypted is what the key file says, as whether
     /// there is one is: the store reads both from the disk when it starts.
+    /// Whether it was revoked is what the store's list of revocations says,
+    /// which outlives the certificate - see <see cref="Revocation.RevokedCertificate"/>.
     /// </remarks>
     public sealed record IssuedCertificate(String                  Id,
                                            CertificateProfile      Profile,
@@ -55,17 +57,21 @@ namespace cloud.charging.open.PKI.Issuance
                                            Boolean                 KeyEncrypted,
                                            Boolean                 FromCSR,
                                            DateTimeOffset          CreatedAt,
-                                           String?                 CreatedBy)
+                                           String?                 CreatedBy,
+                                           DateTimeOffset?         RevokedAt         = null,
+                                           String?                 RevocationReason  = null)
     {
 
         #region StatusAt(Now)
 
         /// <summary>
-        /// "valid", "expired" or "notYetValid", at the given time.
+        /// "revoked", "valid", "expired" or "notYetValid", at the given time.
         /// </summary>
         public String StatusAt(DateTimeOffset Now)
 
-            => Now < NotBefore
+            => RevokedAt is not null
+                   ? "revoked"
+                   : Now < NotBefore
                    ? "notYetValid"
                    : Now > NotAfter
                          ? "expired"
@@ -100,7 +106,9 @@ namespace cloud.charging.open.PKI.Issuance
                            new JProperty("keyEncrypted",             KeyEncrypted),
                            new JProperty("fromCSR",                  FromCSR),
                            new JProperty("createdAt",                CreatedAt.ToString("o", CultureInfo.InvariantCulture)),
-                           new JProperty("createdBy",                CreatedBy)
+                           new JProperty("createdBy",                CreatedBy),
+                           new JProperty("revokedAt",                RevokedAt?.ToString("o", CultureInfo.InvariantCulture)),
+                           new JProperty("revocationReason",         RevocationReason)
                        );
 
             if (Now is not null)
@@ -118,7 +126,8 @@ namespace cloud.charging.open.PKI.Issuance
         /// One entry of the index, or null where it is not one: an entry
         /// somebody broke by hand is passed over rather than stopping the
         /// start, and the certificate it was about is still a file somebody
-        /// can look at.
+        /// can look at. Whether it was revoked is not read from here: the list
+        /// of revocations says that.
         /// </summary>
         public static IssuedCertificate? TryParse(JToken JSON)
         {

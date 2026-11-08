@@ -101,8 +101,12 @@ table.records.pki-list {
 }
 
 // The password of a key, below its PEM in the details: set apart from the
-// certificate above, which goes out, by what never does.
-.pki-details .key-password {
+// certificate above, which goes out, by what never does - and so are the
+// PKCS#12 file, the CRL signed by hand and revoking.
+.pki-details .key-password,
+.pki-details .pkcs12,
+.pki-details .sign-crl,
+.pki-details .revoke {
 
     border-top:   1px solid $color-border;
     margin-top:   1rem;

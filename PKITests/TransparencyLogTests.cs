@@ -462,9 +462,10 @@ namespace cloud.charging.open.PKI.Tests
             var entry  = log.Find(client!.Id)!;
 
             Assert.Multiple(() => {
-                Assert.That(log.Count,                       Is.EqualTo(2));
+                // The root, its OCSP responder, and the client.
+                Assert.That(log.Count,                       Is.EqualTo(3));
                 Assert.That(log.Find(root.Id)!.Index,        Is.EqualTo(0));
-                Assert.That(entry.Index,                     Is.EqualTo(1));
+                Assert.That(entry.Index,                     Is.EqualTo(2));
                 Assert.That(entry.Chain.Single(),            Is.EqualTo(store.Load(root.Id)!.RawData), "the chain above it, up to its root");
                 Assert.That(log.Verify(entry),               Is.True);
             });
@@ -474,7 +475,7 @@ namespace cloud.charging.open.PKI.Tests
             Assert.Multiple(() => {
                 Assert.That(store.Get(client.Id),            Is.Null);
                 Assert.That(log.Find(client.Id),             Is.Not.Null, "deleted from the PKI, and still in its log");
-                Assert.That(new PKIStore(directory).Transparency.Count, Is.EqualTo(2));
+                Assert.That(new PKIStore(directory).Transparency.Count, Is.EqualTo(3));
             });
 
         }

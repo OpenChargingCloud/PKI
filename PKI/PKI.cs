@@ -17,6 +17,8 @@
 
 #region Usings
 
+using System.Diagnostics.CodeAnalysis;
+
 using Newtonsoft.Json.Linq;
 
 using org.GraphDefined.Vanaheimr.Hermod;
@@ -31,6 +33,7 @@ using cloud.charging.open.protocols.WWCP.Node.Configuration;
 using cloud.charging.open.protocols.WWCP.Node.SecureShell;
 
 using cloud.charging.open.PKI.Issuance;
+using cloud.charging.open.PKI.Revocation;
 
 #endregion
 
@@ -128,6 +131,21 @@ namespace cloud.charging.open.PKI
         /// same start that asks for it.
         /// </remarks>
         public static readonly      IReadOnlyList<CertificateKind>  CertificateKinds  = [ .. CertificateKindExtensions.TLS, CertificateKind.TLSServerIdentity ];
+
+        /// <summary>
+        /// The section of the configuration file that is the PKI's own:
+        /// { "publicURL": "http://pki.example.org" }.
+        /// </summary>
+        public const                String    ConfigSection    = "pki";
+
+        /// <summary>
+        /// How often the PKI looks whether a CRL or an OCSP responder is due.
+        /// </summary>
+        public static readonly      TimeSpan  RevocationCheck  = TimeSpan.FromHours(1);
+
+        private readonly            Object           revocationGate      = new();
+        private                     HashSet<String>  revocationProblems  = [];
+        private                     Timer?           revocationTimer;
 
         #endregion
 
@@ -240,6 +258,8 @@ namespace cloud.charging.open.PKI
             foreach (var passedOver in Store.PassedOver)
                 this.Log.Warning($"PKI: {passedOver}", "pki", "security");
 
+            Store.OnWarning = warning => this.Log.Warning($"PKI: {warning}", "pki", "security");
+
             // A broken log stops the PKI from signing: said as loudly as the
             // log can say it.
             if (Store.Transparency.IsBroken)
@@ -265,6 +285,30 @@ namespace cloud.charging.open.PKI
                                      ? $"The private keys of its {caKeys.Count} CA(s) all have a password."
                                      : $"The private key of {unprotected} of its {caKeys.Count} CA(s) has no password: whoever can read that directory can sign as {(unprotected == 1 ? "that CA" : "each of them")}."),
                           "pki", "security");
+
+            #endregion
+
+            #region Where a certificate's revocation is asked about
+
+            // The address the PKI is reached at, from the "pki" section: what
+            // every certificate made below a CA names as where its CRL and its
+            // OCSP responder are.
+            if (this.ConfigFile.TryLoadDocument(out var document, out _) &&
+                document[ConfigSection] is JObject section &&
+                section.Value<String>("publicURL") is String publicURL)
+            {
+                if (RevocationAddresses.TryParse(publicURL, this.HTTPRootPath.ToString(), out var addresses, out var addressError))
+                    Store.Addresses = addresses;
+                else
+                    this.Log.Warning($"PKI: the \"publicURL\" of the \"{ConfigSection}\" section of '{this.ConfigFile.Path}' was passed over: {addressError}", "pki", "configuration");
+            }
+
+            this.Log.Info(Store.Addresses is RevocationAddresses known
+                              ? $"Certificates made below a CA name {known.CRL("<ca>")} as their CRL and {known.OCSP} as their OCSP responder."
+                              : $"Certificates made below a CA name no CRL and no OCSP responder: the \"{ConfigSection}\" section of the configuration file gives no \"publicURL\" the PKI is reached at.",
+                          "pki", "security");
+
+            RefreshRevocation();
 
             #endregion
 
@@ -307,7 +351,95 @@ namespace cloud.charging.open.PKI
 
             Log.Info($"The JSON API is at {APIURL}v1/status", "web", "http");
 
+            revocationTimer = new Timer(_ => RefreshRevocation(), null, RevocationCheck, RevocationCheck);
+
             return Task.CompletedTask;
+
+        }
+
+        #endregion
+
+        #region (protected override) OnStopping()
+
+        protected override async Task OnStopping()
+        {
+
+            if (revocationTimer is not null)
+                await revocationTimer.DisposeAsync();
+
+            revocationTimer = null;
+
+            await base.OnStopping();
+
+        }
+
+        #endregion
+
+
+        #region RefreshRevocation()
+
+        /// <summary>
+        /// Sign anew what is due of the CRLs and the OCSP responders, and say
+        /// in the log what needs somebody - each thing once, until it changes.
+        /// </summary>
+        public void RefreshRevocation()
+        {
+
+            lock (revocationGate)
+            {
+
+                IReadOnlyList<String> problems;
+
+                try
+                {
+                    problems = Store.RefreshRevocation();
+                }
+                catch (Exception e)
+                {
+                    Log.Error($"PKI: the CRLs and OCSP responders could not be looked at: {e.Message}", "pki", "security");
+                    return;
+                }
+
+                foreach (var problem in problems.Where(problem => !revocationProblems.Contains(problem)))
+                    Log.Warning($"PKI: {problem}", "pki", "security");
+
+                revocationProblems = [.. problems];
+
+            }
+
+        }
+
+        #endregion
+
+        #region TrySetPublicURL(PublicURL, out Error)
+
+        /// <summary>
+        /// The address the PKI is reached at, which every certificate made below
+        /// a CA from now on names as where its CRL and its OCSP responder are -
+        /// or none, null; kept in the "pki" section of the configuration file.
+        /// </summary>
+        public Boolean TrySetPublicURL(String?                           PublicURL,
+                                       [NotNullWhen(false)] out String?  Error)
+        {
+
+            RevocationAddresses? addresses = null;
+
+            if (!String.IsNullOrWhiteSpace(PublicURL) &&
+                !RevocationAddresses.TryParse(PublicURL, HTTPRootPath.ToString(), out addresses, out Error))
+            {
+                return false;
+            }
+
+            var saved = addresses is null
+                            ? ConfigFile.TryMergeSection(ConfigSection, [], [ "publicURL" ], out Error)
+                            : ConfigFile.TryMergeSection(ConfigSection, new JObject(new JProperty("publicURL", addresses.PublicURL)), out Error);
+
+            if (!saved)
+                return false;
+
+            Store.Addresses = addresses;
+            Error = null;
+            return true;
 
         }
 
@@ -350,7 +482,9 @@ namespace cloud.charging.open.PKI
                               new JProperty("transparencyLog",
                                                               Store.Transparency.IsBroken
                                                                   ? "broken"
-                                                                  : $"{Store.Transparency.Count} certificate(s)")
+                                                                  : $"{Store.Transparency.Count} certificate(s)"),
+                              new JProperty("revoked",        Store.Revoked().Count),
+                              new JProperty("publicURL",      Store.Addresses?.PublicURL)
                           )));
 
             return json;

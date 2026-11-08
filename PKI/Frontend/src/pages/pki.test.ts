@@ -4,7 +4,9 @@
  * opened from its row, a root CA made from its form and opened in the list,
  * and the forms left out for an account that may sign nothing - and the
  * passwords of keys: optional where a key is made, asked for where the CA
- * chosen to sign has one, and given, changed or taken away in the details.
+ * chosen to sign has one, and given, changed or taken away in the details -
+ * and revoking: a certificate revoked from its details, what the Revocation
+ * tab lists, and a certificate downloaded with its key as PKCS#12.
  */
 
 import { asked, field, open, submit, until, type Asked } from '../../test/pki.ts';
@@ -21,16 +23,33 @@ function certificate(id: string, commonName: string, profile: string, issuerId: 
     return { id, profile, commonName, subject: `CN=${commonName}`, issuer: 'CN=Root', issuerId, serialNumber: '01',
              notBefore: '2026-01-01T00:00:00Z', notAfter: '2036-01-01T00:00:00Z', keyAlgorithm: 'ecc-p384',
              subjectAlternativeNames: [], pathLength: null, hasPrivateKey: true, keyEncrypted, fromCSR: false,
-             createdAt: '2026-01-01T00:00:00Z', createdBy: 'alice', status: 'valid' };
+             createdAt: '2026-01-01T00:00:00Z', createdBy: 'alice', status: 'valid', revokedAt: null, revocationReason: null };
 }
 
 /** What the details of a certificate add to what its list says. */
 function detailed(found: Record<string, unknown>): Record<string, unknown> {
     return { ...found, pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', chainPem: '',
              chain: [ { id: found['id'], commonName: found['commonName'], profile: found['profile'] } ],
-             issuedCount: 0, belowCount: 0, mayDownloadPrivateKey: false,
+             issuedCount: 0, belowCount: 0,
+             mayDownloadPrivateKey: found['profile'] === 'client' || found['profile'] === 'server',
              transparency: { index: 0, loggedAt: '2026-01-01T00:00:00Z',
-                             sct: { sct_version: 0, id: 'bG9n', timestamp: 0, extensions: '', signature: 'c2ln' } } };
+                             sct: { sct_version: 0, id: 'bG9n', timestamp: 0, extensions: '', signature: 'c2ln' } },
+             revocation: found['revokedAt'] ? { id: found['id'], issuerId: found['issuerId'], serialNumber: '01', commonName: found['commonName'],
+                                                notAfter: found['notAfter'], revokedAt: found['revokedAt'], reason: found['revocationReason'], revokedBy: 'alice' } : null,
+             issuerKeyEncrypted: certificates.find(one => one['id'] === found['issuerId'])?.['keyEncrypted'] === true,
+             mayRevoke: found['profile'] !== 'rootCA' && !found['revokedAt'] };
+}
+
+/** What the stand-in says of revoking. */
+function revocationOverview(): unknown {
+    return { publicURL: 'http://pki.example.org', ocspURL: 'http://pki.example.org/api/v1/pki/ocsp',
+             crlURL: 'http://pki.example.org/api/v1/pki/crl/{id}.crl',
+             reasons: [ 'unspecified', 'keyCompromise' ], crlValidDays: 7, crlValidDaysWithPassword: 30, maxCRLValidDays: 365,
+             cas: [ { id: 'aa', commonName: 'OCC Root CA', profile: 'rootCA', automatic: false, hasKey: true,
+                      crl: { number: '3', thisUpdate: '2026-01-01T00:00:00Z', nextUpdate: '2026-01-31T00:00:00Z', entries: 1 }, crlURL: null,
+                      responder: { serialNumber: '02', notBefore: '2026-01-01T00:00:00Z', notAfter: '2027-01-01T00:00:00Z', pem: '' } } ],
+             revoked: [ { id: 'ee', issuerId: 'aa', serialNumber: '05', commonName: 'CS-0009', notAfter: '2027-01-01T00:00:00Z',
+                          revokedAt: '2026-01-03T00:00:00Z', reason: 'keyCompromise', revokedBy: 'alice', inPKI: false, issuer: 'OCC Root CA' } ] };
 }
 
 /** The entries of the stand-in log: what the PKI signed, one of them deleted since. */
@@ -56,6 +75,24 @@ function pki({ method, path, body }: Asked): unknown {
 
     if (method === 'GET' && path.startsWith('/pki/transparency/entries'))
         return { treeSize: logged.length, entries: logged };
+
+    if (method === 'GET' && path === '/pki/revocation')
+        return revocationOverview();
+
+    const revoke = /^\/pki\/certificates\/([0-9a-f]+)\/revoke$/.exec(path);
+
+    if (method === 'POST' && revoke !== null) {
+        const found = certificates.find(certificate => certificate['id'] === revoke[1])!;
+        found['status']            = 'revoked';
+        found['revokedAt']         = '2026-02-01T00:00:00Z';
+        found['revocationReason']  = (body as { reason: string }).reason;
+        return { ...detailed(found), warning: null };
+    }
+
+    const pkcs12 = /^\/pki\/certificates\/([0-9a-f]+)\/pkcs12$/.exec(path);
+
+    if (method === 'POST' && pkcs12 !== null)
+        return { id: pkcs12[1], fileName: 'CS-0001.p12', pkcs12: 'MIIC', legacy: (body as { legacy: boolean }).legacy };
 
     const one = /^\/pki\/certificates\/([0-9a-f]+)$/.exec(path);
 
@@ -291,6 +328,88 @@ describe('the PKI page', () => {
 
     });
 
+    it('revokes a certificate, with the password of the key of its CA', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null, true),
+                         certificate('bb', 'CS-0001',     'client', 'aa') ];
+
+        const root = await open(pkiPage, '/pki', everything, pki, root => root.querySelector('table.pki-list') !== null);
+
+        root.querySelector<HTMLElement>('tr[data-id="bb"]')!.click();
+
+        await until(() => root.querySelector('#revoke-form') !== null, 'the details offer no revocation');
+
+        assert.ok(root.querySelector('#pkcs12-form'), 'the certificate of a client goes out as PKCS#12');
+        assert.equal(root.querySelector('#revoke-form option[value="caCompromise"]'), null, 'caCompromise is the reason of a CA');
+
+        const confirmed = globalThis.confirm;
+        globalThis.confirm = () => true;
+
+        try
+        {
+            field(root, '#revoke-form', 'reason').value             = 'keyCompromise';
+            field(root, '#revoke-form', 'issuerKeyPassword').value  = 'root-password';
+            submit(root, '#revoke-form');
+
+            await until(() => root.querySelector('#pki-made') !== null, 'nothing said it was revoked');
+        }
+        finally
+        {
+            globalThis.confirm = confirmed;
+        }
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/certificates/bb/revoke')!.body as Record<string, unknown>;
+
+        assert.deepEqual(sent, { reason: 'keyCompromise', issuerKeyPassword: 'root-password' });
+        assert.match(root.querySelector('#pki-made')!.textContent!, /Revoked the client 'CS-0001'/);
+
+        await until(() => root.querySelector('#pki-details-revoked') !== null, 'the details do not say it was revoked');
+
+        assert.match(root.querySelector('tr[data-id="bb"]')!.textContent!, /revoked/);
+        assert.equal(root.querySelector('#revoke-form'), null, 'not twice');
+
+    });
+
+    it('downloads a certificate with its key as PKCS#12', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null),
+                         certificate('bb', 'CS-0001',     'client', 'aa', true) ];
+
+        const root = await open(pkiPage, '/pki', everything, pki, root => root.querySelector('table.pki-list') !== null);
+
+        root.querySelector<HTMLElement>('tr[data-id="bb"]')!.click();
+
+        await until(() => root.querySelector('#pkcs12-form') !== null, 'the details offer no PKCS#12');
+
+        field(root, '#pkcs12-form', 'keyPassword').value          = 'key-password';
+        field(root, '#pkcs12-form', 'pkcs12Password').value       = 'file-password';
+        field(root, '#pkcs12-form', 'pkcs12PasswordAgain').value  = 'file-password';
+        submit(root, '#pkcs12-form');
+
+        await until(() => /Downloaded CS-0001\.p12/.test(root.querySelector('#pkcs12-note')?.textContent ?? ''), 'nothing was downloaded');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/certificates/bb/pkcs12')!.body as Record<string, unknown>;
+
+        assert.deepEqual(sent, { keyPassword: 'key-password', pkcs12Password: 'file-password', legacy: false });
+
+    });
+
+    it('lists what was revoked and how the CRL of each CA stands', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null, true) ];
+
+        const root = await open(pkiPage, '/pki?tab=revocation', [ 'issuance:read' ], pki,
+                                root => root.querySelector('table.pki-revoked') !== null);
+
+        assert.match(root.querySelector('#pki-ocsp-url')!.textContent!, /pki\.example\.org\/api\/v1\/pki\/ocsp/);
+        assert.match(root.querySelector('table.pki-revocation-cas tr[data-id="aa"]')!.textContent!, /#3/);
+        assert.match(root.querySelector('table.pki-revocation-cas tr[data-id="aa"]')!.textContent!, /with its password/);
+        assert.match(root.querySelector('table.pki-revoked tr[data-id="ee"]')!.textContent!, /CS-0009.*deleted/s);
+        assert.equal(root.querySelector<HTMLInputElement>('#public-url-form input[name="publicURL"]')!.disabled, true,
+                     'the address is the administrator\'s to set');
+
+    });
+
     it('offers no form to an account that may sign nothing', async () => {
 
         certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null) ];
@@ -299,8 +418,8 @@ describe('the PKI page', () => {
                                 root => root.querySelector('table.pki-list') !== null);
 
         assert.equal(root.querySelector('form'), null);
-        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency' ],
-                         'the list, and the log, which is read as the list is');
+        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency', 'tab-revocation' ],
+                         'the list, the log and what was revoked, which are read as the list is');
         assert.match(root.querySelector('.notice')!.textContent!, /may look at the certificates of this PKI but not sign any/);
 
     });

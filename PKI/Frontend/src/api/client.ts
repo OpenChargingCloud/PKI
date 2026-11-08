@@ -64,8 +64,12 @@ export type CertificateStore = NodeCertificateStore<CertificateKind>;
 /** What a certificate of the PKI is: a root, a CA below one, or a server's or a client's below either. */
 export type CertificateProfile = 'rootCA' | 'subCA' | 'server' | 'client';
 
-/** Whether a certificate holds now. */
-export type CertificateStatus = 'valid' | 'expired' | 'notYetValid';
+/** Whether a certificate holds now - a revoked one never again. */
+export type CertificateStatus = 'valid' | 'expired' | 'notYetValid' | 'revoked';
+
+/** Why a certificate was revoked, in the names of RFC 5280. */
+export type RevocationReason = 'unspecified' | 'keyCompromise' | 'caCompromise' | 'affiliationChanged' |
+                               'superseded'  | 'cessationOfOperation' | 'privilegeWithdrawn';
 
 /** One certificate this PKI made, as its list shows it. */
 export interface PKICertificate {
@@ -92,6 +96,9 @@ export interface PKICertificate {
     createdAt:                string;
     createdBy:                string | null;
     status:                   CertificateStatus;
+    /** When it was revoked, and why; null where it was not. */
+    revokedAt:                string | null;
+    revocationReason:         RevocationReason | null;
 }
 
 /** One certificate, as its details show it. */
@@ -108,6 +115,64 @@ export interface PKICertificateDetails extends PKICertificate {
     mayDownloadPrivateKey:  boolean;
     /** Where it is in the transparency log of the PKI; null where the log does not have it. */
     transparency:           CertificateInTheLog | null;
+    /** Its revocation; null where it was not revoked. */
+    revocation:             RevokedCertificate | null;
+    /** Of a CA: its CRL and its OCSP responder. */
+    revocationServices?:    CARevocation;
+    /** Whether the key of its CA - which signs the CRL a revocation goes into - has a password. */
+    issuerKeyEncrypted:     boolean;
+    /** Whether whoever is signed in may revoke it: never a root, never twice. */
+    mayRevoke:              boolean;
+}
+
+/** One certificate revoked: it stays revoked after it is deleted from the PKI. */
+export interface RevokedCertificate {
+    id:            string;
+    issuerId:      string;
+    serialNumber:  string;
+    commonName:    string;
+    notAfter:      string;
+    revokedAt:     string;
+    reason:        RevocationReason;
+    revokedBy:     string | null;
+    /** In the list of every revocation: whether the PKI still has it, and the common name of its CA. */
+    inPKI?:        boolean;
+    issuer?:       string | null;
+}
+
+/** What a CRL says of itself. */
+export interface CRLInfo {
+    /** A number of any size, as text. */
+    number:      string;
+    thisUpdate:  string;
+    nextUpdate:  string | null;
+    entries:     number;
+}
+
+/** The CRL and the OCSP responder of one CA - which the PKI keeps by itself where the CA's key has no password. */
+export interface CARevocation {
+    id:          string;
+    commonName:  string;
+    profile:     CertificateProfile;
+    automatic:   boolean;
+    hasKey:      boolean;
+    crl:         CRLInfo | null;
+    /** Where certificates find it; null where the PKI was told no address. */
+    crlURL:      string | null;
+    responder:   { serialNumber: string; notBefore: string; notAfter: string; pem: string } | null;
+}
+
+/** What the PKI says of revoking: where it is reached at, every CA's CRL and responder, every revocation. */
+export interface RevocationOverview {
+    publicURL:                 string | null;
+    ocspURL:                   string | null;
+    crlURL:                    string | null;
+    reasons:                   RevocationReason[];
+    crlValidDays:              number;
+    crlValidDaysWithPassword:  number;
+    maxCRLValidDays:           number;
+    cas:                       CARevocation[];
+    revoked:                   RevokedCertificate[];
 }
 
 /** A signed certificate timestamp, as RFC 6962 writes one: the log's id and signature in Base64. */
@@ -160,7 +225,10 @@ export interface LogEntry {
     profile:     CertificateProfile;
     notAfter:    string;
     /** Whether the PKI still has it: a deleted one stays in the log. */
-    inPKI:       boolean;
+    inPKI:          boolean;
+    revoked:        boolean;
+    /** Whether it is the OCSP responder of a CA, which is kept beside the CA rather than in the list. */
+    ocspResponder:  boolean;
 }
 
 /** Every certificate of the PKI, and what it makes new ones with. */
@@ -263,7 +331,15 @@ export const api = {
         signCSR:     (signing: CSRSigning)             => request<PKICertificateDetails> ('POST',   '/pki/csr',          signing),
         inspectCSR:  (csr: string)                     => request<CSRInspection>         ('POST',   '/pki/csr/inspect',  { csr }),
         transparency: ()                               => request<TransparencyLog>       ('GET',    '/pki/transparency'),
-        logEntries:  (start: number, end: number)      => request<{ treeSize: number; entries: LogEntry[] }>('GET', `/pki/transparency/entries?start=${start}&end=${end}`)
+        logEntries:  (start: number, end: number)      => request<{ treeSize: number; entries: LogEntry[] }>('GET', `/pki/transparency/entries?start=${start}&end=${end}`),
+        revoke:      (id: string, reason: RevocationReason, issuerKeyPassword: string | null) =>
+                                                          request<PKICertificateDetails & { warning: string | null }>('POST', `${pki(id)}/revoke`, { reason, issuerKeyPassword }),
+        signCRL:     (id: string, keyPassword: string | null, validDays: number | null) =>
+                                                          request<CARevocation>          ('POST',   `${pki(id)}/crl`, { keyPassword, validDays }),
+        pkcs12:      (id: string, keyPassword: string | null, pkcs12Password: string, legacy: boolean) =>
+                                                          request<{ id: string; fileName: string; pkcs12: string; legacy: boolean }>('POST', `${pki(id)}/pkcs12`, { keyPassword, pkcs12Password, legacy }),
+        revocation:  ()                                => request<RevocationOverview>    ('GET',    '/pki/revocation'),
+        setPublicURL: (publicURL: string | null)       => request<RevocationOverview>    ('PUT',    '/pki/revocation', { publicURL })
     }
 
 };

@@ -25,6 +25,7 @@ using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
+using cloud.charging.open.PKI.Revocation;
 using cloud.charging.open.PKI.Transparency;
 
 #endregion
@@ -92,6 +93,10 @@ namespace cloud.charging.open.PKI.Issuance
     /// kept, and a deleted one stays in the log.
     /// </para>
     /// <para>
+    /// And in "revocation", what it revoked: a CRL per CA, and an OCSP
+    /// responder per CA - see PKIStore.Revocation.cs.
+    /// </para>
+    /// <para>
     /// Everything that changes the store does so under one lock, and writes
     /// the index through a temporary file moved into place, so that a
     /// process dying mid-write leaves the old index behind and not half of
@@ -99,7 +104,7 @@ namespace cloud.charging.open.PKI.Issuance
     /// are deleted again - and said as such, with <c>NotSaved</c>.
     /// </para>
     /// </remarks>
-    public sealed class PKIStore
+    public sealed partial class PKIStore
     {
 
         #region Data
@@ -270,6 +275,8 @@ namespace cloud.charging.open.PKI.Issuance
                 }
 
             }
+
+            LoadRevocations(passedOver);
 
             #region The transparency log, with every certificate of the store in it
 
@@ -511,7 +518,7 @@ namespace cloud.charging.open.PKI.Issuance
             var subject     = Subject.ToX500();
 
             var request     = NewRequest(subject, new PublicKey(key), KeyAlgorithm.Hash);
-            AddExtensions(request, CertificateProfile.RootCA, request.PublicKey, PathLength, [], issuer: null);
+            AddExtensions(request, CertificateProfile.RootCA, request.PublicKey, PathLength, [], issuer: null, IssuerId: null);
 
             using var certificate = request.Create(
                                         subject,
@@ -521,7 +528,14 @@ namespace cloud.charging.open.PKI.Issuance
                                         NewSerialNumber()
                                     );
 
-            return TryKeep(certificate, key, KeyPassword, CertificateProfile.RootCA, null, PathLength, false, CreatedBy, out Certificate, out Error, out NotSaved);
+            if (!TryKeep(certificate, key, KeyPassword, CertificateProfile.RootCA, null, PathLength, false, CreatedBy, out Certificate, out Error, out NotSaved))
+                return false;
+
+            // Its key is open now, and may not be again for a while: its CRL
+            // and its OCSP responder, while it is.
+            Warn(KeepRevocationFresh(Certificate, certificate, key, ForceCRL: true, Validity: null));
+
+            return true;
 
         }
 
@@ -813,6 +827,8 @@ namespace cloud.charging.open.PKI.Issuance
                     }
                 }
 
+                ForgetRevocationOf(removed);
+
                 Removed = removed;
                 Error   = leftBehind.Count > 0
                               ? $"Deleted from the index, but these files could not be deleted: {String.Join(", ", leftBehind)}"
@@ -1042,7 +1058,7 @@ namespace cloud.charging.open.PKI.Issuance
             var hash     = KeyAlgorithm.Of(issuerCertificate.PublicKey)?.Hash ?? HashAlgorithmName.SHA256;
             var request  = NewRequest(Subject, PublicKey, hash);
 
-            AddExtensions(request, Profile, PublicKey, PathLength, AlternativeNames, issuerCertificate);
+            AddExtensions(request, Profile, PublicKey, PathLength, AlternativeNames, issuerCertificate, issuer.Id);
 
             using var certificate = request.Create(
                                         issuerCertificate.SubjectName,
@@ -1052,7 +1068,18 @@ namespace cloud.charging.open.PKI.Issuance
                                         NewSerialNumber()
                                     );
 
-            return TryKeep(certificate, PrivateKey, KeyPassword, Profile, issuer.Id, PathLength, FromCSR, CreatedBy, out Certificate, out Error, out NotSaved);
+            if (!TryKeep(certificate, PrivateKey, KeyPassword, Profile, issuer.Id, PathLength, FromCSR, CreatedBy, out Certificate, out Error, out NotSaved))
+                return false;
+
+            // The key of the CA is open, and that of a new sub-CA too: what is
+            // due of their CRLs and responders, while they are - for a CA
+            // whose key has a password, the only time it is.
+            Warn(KeepRevocationFresh(issuer, issuerCertificate, issuerKey, ForceCRL: false, Validity: null));
+
+            if (Profile == CertificateProfile.SubCA && PrivateKey is not null)
+                Warn(KeepRevocationFresh(Certificate, certificate, PrivateKey, ForceCRL: true, Validity: null));
+
+            return true;
 
         }
 
@@ -1249,12 +1276,13 @@ namespace cloud.charging.open.PKI.Issuance
         /// it, what its key may be used for, what it is for in TLS, its other
         /// names, and the identifiers that link it to its key and its CA.
         /// </summary>
-        private static void AddExtensions(CertificateRequest     Request,
-                                          CertificateProfile     Profile,
-                                          PublicKey              PublicKey,
-                                          Int32?                 PathLength,
-                                          IReadOnlyList<String>  AlternativeNames,
-                                          X509Certificate2?      issuer)
+        private void AddExtensions(CertificateRequest     Request,
+                                   CertificateProfile     Profile,
+                                   PublicKey              PublicKey,
+                                   Int32?                 PathLength,
+                                   IReadOnlyList<String>  AlternativeNames,
+                                   X509Certificate2?      issuer,
+                                   String?                IssuerId)
         {
 
             var isRSA = PublicKey.GetRSAPublicKey() is not null;
@@ -1295,6 +1323,15 @@ namespace cloud.charging.open.PKI.Issuance
 
             if (issuer is not null)
                 Request.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(issuer, includeKeyIdentifier: true, includeIssuerAndSerial: false));
+
+            // Where whoever checks it asks whether it was revoked, and finds
+            // the CA it was signed by - where the PKI was told the address it
+            // is reached at.
+            if (issuer is not null && IssuerId is not null && Addresses is RevocationAddresses addresses)
+            {
+                Request.CertificateExtensions.Add(CertificateRevocationListBuilder.BuildCrlDistributionPointExtension([ addresses.CRL(IssuerId) ], critical: false));
+                Request.CertificateExtensions.Add(new X509AuthorityInformationAccessExtension([ addresses.OCSP ], [ addresses.CAIssuer(IssuerId) ], critical: false));
+            }
 
         }
 
@@ -1540,6 +1577,16 @@ namespace cloud.charging.open.PKI.Issuance
             => Profile == CertificateProfile.Server && AlternativeNames.Count == 0 && Issuance.AlternativeNames.LooksLikeAHostName(CommonName)
                    ? [ CommonName ]
                    : AlternativeNames;
+
+        #endregion
+
+        #region (private) Warn(Problems)
+
+        private void Warn(IEnumerable<String> Problems)
+        {
+            foreach (var problem in Problems)
+                OnWarning?.Invoke(problem);
+        }
 
         #endregion
 

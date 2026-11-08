@@ -172,6 +172,12 @@ namespace cloud.charging.open.PKI.Tests
             return (response.StatusCode, JObject.Parse(await response.Content.ReadAsStringAsync()));
         }
 
+        private static async Task<(HttpStatusCode Status, JObject JSON)> Put(HttpClient Client, String Path, Object JSON)
+        {
+            var response = await Client.PutAsync(Path, new StringContent(JObject.FromObject(JSON).ToString(), Encoding.UTF8, "application/json"));
+            return (response.StatusCode, JObject.Parse(await response.Content.ReadAsStringAsync()));
+        }
+
         private static async Task<(HttpStatusCode Status, JObject JSON)> Delete(HttpClient Client, String Path)
         {
             var response = await Client.DeleteAsync(Path);
@@ -465,7 +471,8 @@ namespace cloud.charging.open.PKI.Tests
                                          subject  = new { commonName = $"CS-{i:D4}" }
                                      });
                 Assert.That(status, Is.EqualTo(HttpStatusCode.Created), made.ToString());
-                Assert.That(made["transparency"]!["index"]!.Value<Int64>(), Is.EqualTo(i));
+                // After the root and its OCSP responder.
+                Assert.That(made["transparency"]!["index"]!.Value<Int64>(), Is.EqualTo(i + 1));
             }
 
             #region The log, and its newest tree head checked with its key
@@ -474,7 +481,7 @@ namespace cloud.charging.open.PKI.Tests
 
             Assert.That(status,                                Is.EqualTo(HttpStatusCode.OK), log.ToString());
             Assert.That(log["broken"]!.Value<Boolean>(),       Is.False);
-            Assert.That(log["treeSize"]!.Value<Int64>(),       Is.EqualTo(4));
+            Assert.That(log["treeSize"]!.Value<Int64>(),       Is.EqualTo(5));
 
             using var publicKey = ECDsa.Create();
             publicKey.ImportFromPem(log["publicKey"]!.Value<String>());
@@ -487,7 +494,7 @@ namespace cloud.charging.open.PKI.Tests
 
             Byte[] signed = [ 0, 1, .. BigEndian(sth["timestamp"]!.Value<Int64>()), .. BigEndian(treeSize), .. rootHash ];
 
-            Assert.That(treeSize, Is.EqualTo(4));
+            Assert.That(treeSize, Is.EqualTo(5));
             Assert.That(publicKey.VerifyData(signed, signature[4..], HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence), Is.True);
 
             #endregion
@@ -496,7 +503,7 @@ namespace cloud.charging.open.PKI.Tests
 
             (status, var entries) = await Get(operator_, $"{ct}/get-entries?start=0&end=99");
 
-            Assert.That(entries["entries"]!.Count(), Is.EqualTo(4), "as many as there are");
+            Assert.That(entries["entries"]!.Count(), Is.EqualTo(5), "as many as there are");
 
             foreach (var (entry, index) in entries["entries"]!.Select((entry, index) => (entry, index)))
             {
@@ -534,18 +541,20 @@ namespace cloud.charging.open.PKI.Tests
 
             Assert.That(roots["certificates"]!.Count(), Is.EqualTo(1));
 
-            (status, var listed) = await Get(operator_, "api/v1/pki/transparency/entries?start=0&end=3");
-            var lastId           = listed["entries"]![3]!["id"]!.Value<String>();
+            (status, var listed) = await Get(operator_, "api/v1/pki/transparency/entries?start=0&end=4");
+            var lastId           = listed["entries"]![4]!["id"]!.Value<String>();
+
+            Assert.That(listed["entries"]![1]!["ocspResponder"]!.Value<Boolean>(), Is.True, "the OCSP responder of the root");
 
             (status, _) = await Delete(admin, $"api/v1/pki/certificates/{lastId}");
             Assert.That(status, Is.EqualTo(HttpStatusCode.OK));
 
-            (status, listed) = await Get(operator_, "api/v1/pki/transparency/entries?start=0&end=3");
+            (status, listed) = await Get(operator_, "api/v1/pki/transparency/entries?start=0&end=4");
 
-            Assert.That(listed["entries"]!.Count(),                       Is.EqualTo(4));
-            Assert.That(listed["entries"]![3]!["inPKI"]!.Value<Boolean>(), Is.False);
-            Assert.That(listed["entries"]![3]!["commonName"]!.Value<String>(), Is.EqualTo("CS-0003"));
-            Assert.That(listed["entries"]![3]!["profile"]!.Value<String>(),    Is.EqualTo("client"));
+            Assert.That(listed["entries"]!.Count(),                       Is.EqualTo(5));
+            Assert.That(listed["entries"]![4]!["inPKI"]!.Value<Boolean>(), Is.False);
+            Assert.That(listed["entries"]![4]!["commonName"]!.Value<String>(), Is.EqualTo("CS-0003"));
+            Assert.That(listed["entries"]![4]!["profile"]!.Value<String>(),    Is.EqualTo("client"));
 
             #endregion
 
@@ -558,6 +567,144 @@ namespace cloud.charging.open.PKI.Tests
             #endregion
 
         }
+
+        #region AnybodyAsksWhetherACertificateWasRevoked()
+
+        /// <summary>
+        /// A registrar revokes, an operator does not; the CRL, the CA and the
+        /// OCSP responder answer whoever asks, signed in or not, over POST and
+        /// GET; a certificate made after the PKI was told its address names
+        /// them; and a certificate goes out with its key as PKCS#12.
+        /// </summary>
+        [Test]
+        public async Task AnybodyAsksWhetherACertificateWasRevoked()
+        {
+
+            await TestPorts.StartedOnFreshPorts(PKIFrom);
+
+            using var admin      = await SignedInAs("admin4",     "systemadmin");
+            using var registrar  = await SignedInAs("registrar4", "registrar");
+            using var operator_  = await SignedInAs("operator4",  "operator");
+            using var anybody    = new HttpClient { BaseAddress = address, Timeout = TimeSpan.FromSeconds(30) };
+
+            var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new { subject = new { commonName = "Revocation Root" } });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), root.ToString());
+
+            var rootId = root["id"]!.Value<String>()!;
+
+            #region The address the PKI is reached at, named by what is made after it
+
+            (status, var settings) = await Put(registrar, "api/v1/pki/revocation", new { publicURL = "http://pki.example.org" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Forbidden), "the address is the administrator's to set");
+
+            (status, settings) = await Put(admin, "api/v1/pki/revocation", new { publicURL = "http://pki.example.org" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.OK), settings.ToString());
+            Assert.That(settings["ocspURL"]!.Value<String>(), Is.EqualTo("http://pki.example.org/api/v1/pki/ocsp"));
+
+            (status, var client) = await Post(registrar, "api/v1/pki/certificates", new {
+                                       issuer       = rootId,
+                                       profile      = "client",
+                                       subject      = new { commonName = "CS-0001" },
+                                       keyPassword  = "station-key-password"
+                                   });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), client.ToString());
+
+            using var x509 = X509Certificate2.CreateFromPem(client["pem"]!.Value<String>()!);
+
+            Assert.That(x509.Extensions.OfType<X509AuthorityInformationAccessExtension>().Single().EnumerateOcspUris(),
+                        Is.EqualTo(new[] { "http://pki.example.org/api/v1/pki/ocsp" }));
+
+            #endregion
+
+            #region PKCS#12, with the key's password and one of its own
+
+            (status, var pkcs12) = await Post(registrar, $"api/v1/pki/certificates/{client["id"]}/pkcs12", new {
+                                       keyPassword     = "station-key-password",
+                                       pkcs12Password  = "file-password"
+                                   });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.OK), pkcs12.ToString());
+            Assert.That(pkcs12["fileName"]!.Value<String>(), Is.EqualTo("CS-0001.p12"));
+            Assert.That(X509CertificateLoader.LoadPkcs12Collection(Convert.FromBase64String(pkcs12["pkcs12"]!.Value<String>()!), "file-password",
+                                                                   X509KeyStorageFlags.EphemeralKeySet).Single().HasPrivateKey, Is.True);
+
+            (status, _) = await Post(operator_, $"api/v1/pki/certificates/{client["id"]}/pkcs12", new { pkcs12Password = "file-password" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Forbidden));
+
+            #endregion
+
+            #region Revoked by the registrar, not by the operator
+
+            (status, _) = await Post(operator_, $"api/v1/pki/certificates/{client["id"]}/revoke", new { reason = "keyCompromise" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Forbidden));
+
+            (status, var revoked) = await Post(registrar, $"api/v1/pki/certificates/{client["id"]}/revoke", new { reason = "keyCompromise" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.OK), revoked.ToString());
+
+            Assert.Multiple(() => {
+                Assert.That(revoked["status"]!.Value<String>(),                         Is.EqualTo("revoked"));
+                Assert.That(revoked["revocation"]!["reason"]!.Value<String>(),          Is.EqualTo("keyCompromise"));
+                Assert.That(revoked["revocation"]!["revokedBy"]!.Value<String>(),       Is.EqualTo("registrar4"));
+                Assert.That(revoked["mayRevoke"]!.Value<Boolean>(),                     Is.False);
+            });
+
+            #endregion
+
+            #region The CRL and the CA, to anybody
+
+            var crlResponse = await anybody.GetAsync($"api/v1/pki/crl/{rootId}.crl");
+            var crl         = await crlResponse.Content.ReadAsByteArrayAsync();
+
+            Assert.That(crlResponse.StatusCode,                             Is.EqualTo(HttpStatusCode.OK));
+            Assert.That(crlResponse.Content.Headers.ContentType?.MediaType, Is.EqualTo("application/pkix-crl"));
+            Assert.That(CertificateRevocationListBuilder.Load(crl, out _).RemoveEntry(Convert.FromHexString(x509.SerialNumber)), Is.True);
+
+            var caResponse  = await anybody.GetAsync($"api/v1/pki/ca/{rootId}.crt");
+            using var ca    = X509CertificateLoader.LoadCertificate(await caResponse.Content.ReadAsByteArrayAsync());
+
+            Assert.That(Issuance.PKIStore.Normalized(ca.GetCertHashString(HashAlgorithmName.SHA256)), Is.EqualTo(rootId));
+
+            #endregion
+
+            #region The responder, to anybody, over POST and GET
+
+            var request   = Revocation.OCSP.Request(ca, [ x509.SerialNumber ]);
+            var content   = new ByteArrayContent(request);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/ocsp-request");
+
+            var posted    = await anybody.PostAsync("api/v1/pki/ocsp", content);
+
+            Assert.That(posted.Content.Headers.ContentType?.MediaType, Is.EqualTo("application/ocsp-response"));
+            Assert.That(Revocation.OCSP.TryParseResponse(await posted.Content.ReadAsByteArrayAsync(), out var answer, out var error), Is.True, error);
+            Assert.That(answer!.Responses.Single().Status, Is.EqualTo(Revocation.OCSPCertStatus.Revoked));
+            Assert.That(answer.IsSignedBy(answer.Certificates.Single()), Is.True);
+
+            // The slashes of Base64 as they are: the HTTP server takes no "%2F".
+            var got       = await anybody.GetAsync($"api/v1/pki/ocsp/{Convert.ToBase64String(request).Replace("+", "%2B").Replace("=", "%3D")}");
+
+            Assert.That(Revocation.OCSP.TryParseResponse(await got.Content.ReadAsByteArrayAsync(), out var answerOfGET, out error), Is.True, $"{got.StatusCode} {got.RequestMessage?.RequestUri} {await got.Content.ReadAsStringAsync()}");
+            Assert.That(answerOfGET!.Responses.Single().Status, Is.EqualTo(Revocation.OCSPCertStatus.Revoked));
+
+            #endregion
+
+            #region What the revocation page reads, signed in
+
+            (status, var revocation) = await Get(operator_, "api/v1/pki/revocation");
+
+            Assert.Multiple(() => {
+                Assert.That(status,                                                         Is.EqualTo(HttpStatusCode.OK));
+                Assert.That(revocation["revoked"]!.Single()["commonName"]!.Value<String>(), Is.EqualTo("CS-0001"));
+                Assert.That(revocation["cas"]!.Single()["crl"]!["entries"]!.Value<Int32>(), Is.EqualTo(1));
+                Assert.That(revocation["cas"]!.Single()["automatic"]!.Value<Boolean>(),     Is.True);
+                Assert.That(revocation["cas"]!.Single()["responder"],                       Is.Not.Null);
+            });
+
+            Assert.That((await anybody.GetAsync("api/v1/pki/revocation")).StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized));
+
+            #endregion
+
+        }
+
+        #endregion
 
         private static Byte[] BigEndian(Int64 Value)
         {

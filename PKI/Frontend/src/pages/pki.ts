@@ -6,6 +6,8 @@ import { api,
          type PKICertificate,
          type PKICertificateDetails,
          type PKICertificates,
+         type RevocationOverview,
+         type RevocationReason,
          type SubjectName,
          type TransparencyLog }  from '../api/client';
 import { auth } from '../auth';
@@ -33,6 +35,12 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  * order it signed them - a deleted one too - with the address a monitor reads
  * it at, and what the log signed last.
  *
+ * And what the PKI revoked: a certificate is revoked in its details, and goes
+ * into the CRL of its CA and is "revoked" when its responder is asked; the
+ * Revocation tab says where certificates find them, and how each CA's CRL and
+ * responder stand. A server's or a client's certificate goes out with its key
+ * as a PKCS#12 file too.
+ *
  * A key made here may be given a password, and need not. A CA whose key has
  * one signs only where its password is given again, so a form shows the field
  * for it once such a CA is chosen to sign; the details of a certificate give
@@ -53,6 +61,17 @@ function keyName(Algorithm: string): string {
     const rsa = /^rsa-(\d+)$/i.exec(Algorithm);
     return ecc ? `ECC P-${ecc[1]}` : rsa ? `RSA ${rsa[1]}` : Algorithm;
 }
+
+/** Why a certificate was revoked, as a sentence says it. */
+const reasonWords: Record<RevocationReason, string> = {
+    unspecified:           'no reason given',
+    keyCompromise:         'its key was compromised',
+    caCompromise:          'the key of a CA was compromised',
+    affiliationChanged:    'who it is about changed',
+    superseded:            'a new one replaces it',
+    cessationOfOperation:  'it is not used any more',
+    privilegeWithdrawn:    'what it allowed was withdrawn'
+};
 
 /** A day, as the browser's language writes it. */
 function day(Iso: string): string {
@@ -84,6 +103,24 @@ function download(Name: string, Text: string): void {
 
     const url  = URL.createObjectURL(new Blob([ Text ], { type: 'application/x-pem-file' }));
     const link = document.createElement('a');
+
+    link.href      = url;
+    link.download  = Name;
+
+    document.body.append(link);
+    link.click();
+    link.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1_000);
+
+}
+
+/** Hand the browser bytes, given as Base64, as a file to save. */
+function downloadBase64(Name: string, Base64: string, Type: string): void {
+
+    const bytes = Uint8Array.from(atob(Base64), character => character.charCodeAt(0));
+    const url   = URL.createObjectURL(new Blob([ bytes ], { type: Type }));
+    const link  = document.createElement('a');
 
     link.href      = url;
     link.download  = Name;
@@ -143,10 +180,11 @@ export const pkiPage: Page = {
             { id: 'sub-ca',        label: 'New sub-CA',       icon: 'fa-sitemap'        },
             { id: 'issue',         label: 'New certificate',  icon: 'fa-file-signature' },
             { id: 'csr',           label: 'Sign a CSR',       icon: 'fa-file-import'    },
-            { id: 'transparency',  label: 'Transparency log', icon: 'fa-scroll'         }
+            { id: 'transparency',  label: 'Transparency log', icon: 'fa-scroll'         },
+            { id: 'revocation',    label: 'Revocation',       icon: 'fa-ban'            }
         ];
 
-        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency'
+        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency' || tab.id === 'revocation'
                                         || ((tab.id === 'root-ca' || tab.id === 'sub-ca') && mayMakeCAs)
                                         ||  (tab.id === 'issue'                          && maySign)
                                         ||  (tab.id === 'csr'                            && (maySign || mayMakeCAs)));
@@ -177,6 +215,10 @@ export const pkiPage: Page = {
         let logShown                                       = logPage;
         let logProblem                                     = '';
 
+        /** What the PKI says of revoking, once the tab is shown. */
+        let revocation:      RevocationOverview | null     = null;
+        let revocationProblem                              = '';
+
         /** The CA each form has chosen to sign, by the id of the form; its first where none was. */
         const issuerChosen: Record<string, string> = {};
 
@@ -193,6 +235,8 @@ export const pkiPage: Page = {
             draw();
             if (id === 'transparency')
                 void loadLog();
+            if (id === 'revocation')
+                void loadRevocation();
         }
 
         /** Every certificate, or those the filter lets through. */
@@ -258,6 +302,10 @@ export const pkiPage: Page = {
 
                 <section class="tab-panel" role="tabpanel" id="panel-transparency" aria-labelledby="tab-transparency" ?hidden=${shown !== 'transparency'}>
                     ${transparencyView()}
+                </section>
+
+                <section class="tab-panel" role="tabpanel" id="panel-revocation" aria-labelledby="tab-revocation" ?hidden=${shown !== 'revocation'}>
+                    ${revocationView()}
                 </section>
 
             `);
@@ -335,7 +383,9 @@ export const pkiPage: Page = {
         function statusChip(Certificate: PKICertificate): TemplateResult {
             return Certificate.status === 'valid'
                        ? html`<span class="chip ok">valid</span>`
-                       : html`<span class="chip warn">${Certificate.status === 'expired' ? 'expired' : 'not yet valid'}</span>`;
+                       : Certificate.status === 'revoked'
+                             ? html`<span class="chip bad">revoked</span>`
+                             : html`<span class="chip warn">${Certificate.status === 'expired' ? 'expired' : 'not yet valid'}</span>`;
         }
 
 
@@ -382,6 +432,12 @@ export const pkiPage: Page = {
                         ? html`entry #${certificate.transparency.index}, since ${moment(certificate.transparency.loggedAt)}`
                         : html`<span class="muted">not in it</span>`}</span></div>
                     <div class="kv"><span class="k">Made</span><span class="v">${moment(certificate.createdAt)}${certificate.createdBy !== null ? ` by ${certificate.createdBy}` : ''}</span></div>
+                    ${certificate.revocation ? html`
+                        <div class="kv"><span class="k">Revoked</span><span class="v" id="pki-details-revoked">
+                            ${moment(certificate.revocation.revokedAt)}${certificate.revocation.revokedBy !== null ? ` by ${certificate.revocation.revokedBy}` : ''}:
+                            ${reasonWords[certificate.revocation.reason]}
+                        </span></div>` : nothing}
+                    ${certificate.revocationServices ? caRevocationRows(certificate.revocationServices) : nothing}
 
                     <div class="pki-actions">
                         <button type="button" class="btn small" id="pki-copy" @click=${(event: Event) => void copy(event.currentTarget as HTMLButtonElement, certificate.pem)}>
@@ -398,6 +454,10 @@ export const pkiPage: Page = {
                             <button type="button" class="btn small" id="pki-download-key" @click=${() => void downloadKey(certificate)}>
                                 <i class="fa-solid fa-key"></i> Private key
                             </button>` : nothing}
+                        ${certificate.revocationServices?.crl ? html`
+                            <a class="btn small" id="pki-download-crl" href="${apiURL(`/pki/crl/${certificate.id}.crl`)}" download="${fileName(certificate, '.crl')}">
+                                <i class="fa-solid fa-ban"></i> CRL
+                            </a>` : nothing}
                         ${mayDelete ? html`
                             <button type="button" class="btn small danger" id="pki-delete" @click=${() => void remove(certificate)}>
                                 <i class="fa-solid fa-trash"></i> Delete
@@ -408,10 +468,212 @@ export const pkiPage: Page = {
 
                     <pre class="pem">${certificate.pem}</pre>
 
+                    ${certificate.mayDownloadPrivateKey ? pkcs12View(certificate) : nothing}
+
                     ${certificate.hasPrivateKey && mayDelete ? keyPasswordView(certificate) : nothing}
+
+                    ${certificate.revocationServices && certificate.hasPrivateKey && mayMakeCAs ? signCRLView(certificate) : nothing}
+
+                    ${certificate.mayRevoke ? revokeView(certificate) : nothing}
 
                 </section>
             `;
+
+        }
+
+        /** What a CA's CRL and responder say, in the rows of its details. */
+        function caRevocationRows(Services: NonNullable<PKICertificateDetails['revocationServices']>): TemplateResult {
+            return html`
+                <div class="kv"><span class="k">CRL</span><span class="v" id="pki-details-crl">${Services.crl
+                    ? html`number ${Services.crl.number}, ${Services.crl.entries} certificate(s) in it, signed ${moment(Services.crl.thisUpdate)}${Services.crl.nextUpdate !== null ? html`, until ${moment(Services.crl.nextUpdate)}` : nothing}
+                           ${Services.automatic ? html`<span class="muted">- signed anew by the PKI by itself</span>` : nothing}`
+                    : html`<span class="muted">none yet${Services.hasKey ? ' - signed the next time its key is open' : ': its key is not in this PKI'}</span>`}</span></div>
+                <div class="kv"><span class="k">OCSP responder</span><span class="v" id="pki-details-responder">${Services.responder
+                    ? html`until ${moment(Services.responder.notAfter)}`
+                    : html`<span class="muted">none yet</span>`}</span></div>
+            `;
+        }
+
+        /** The certificate, its key and the sub-CAs above it, as one PKCS#12 file. */
+        function pkcs12View(Certificate: PKICertificateDetails): TemplateResult {
+            return html`
+                <form id="pkcs12-form" class="form-stack pkcs12" @submit=${(event: SubmitEvent) => onPKCS12(event, Certificate)}>
+
+                    <h3><i class="fa-solid fa-file-zipper"></i> As PKCS#12</h3>
+
+                    <p class="hint">
+                        The certificate, its private key and the sub-CAs above it - not the root - in one file, as Windows,
+                        Java and many a charging station import it. The file is encrypted with a password of its own.
+                    </p>
+
+                    ${Certificate.keyEncrypted ? html`
+                        <label>Password of its key
+                            <input type="password" name="keyPassword" required autocomplete="off" />
+                        </label>` : nothing}
+
+                    <label>Password of the file
+                        <input type="password" name="pkcs12Password" required minlength="${current?.minKeyPasswordLength ?? 8}" autocomplete="new-password" />
+                        <span class="hint">${current?.minKeyPasswordLength ?? 8} characters at least; whatever imports the file asks for it.</span>
+                    </label>
+                    <label>The password again
+                        <input type="password" name="pkcs12PasswordAgain" required autocomplete="new-password" />
+                    </label>
+                    <label class="checkbox">
+                        <input type="checkbox" name="legacy" />
+                        Encrypted as older devices read it - Triple-DES and SHA-1, for nothing that opens AES
+                    </label>
+
+                    ${formActions('pkcs12', 'Download as PKCS#12')}
+
+                </form>
+            `;
+        }
+
+        async function onPKCS12(event: SubmitEvent, Certificate: PKICertificateDetails): Promise<void> {
+
+            event.preventDefault();
+
+            const form      = event.currentTarget as HTMLFormElement;
+            const error     = must<HTMLElement>(content, '#pkcs12-error');
+            const password  = field(form, 'pkcs12Password', false);
+
+            error.textContent = '';
+
+            if (password !== field(form, 'pkcs12PasswordAgain', false)) {
+                error.textContent = 'The two passwords are not the same.';
+                return;
+            }
+
+            const keyPassword  = Certificate.keyEncrypted ? field(form, 'keyPassword', false) : null;
+            const legacy       = isChecked(form, 'legacy');
+
+            try
+            {
+                const file = await whileSaving(content, must<HTMLElement>(content, '#pkcs12-note'),
+                                               () => api.pki.pkcs12(Certificate.id, keyPassword, password, legacy));
+                form.reset();
+                downloadBase64(file.fileName, file.pkcs12, 'application/x-pkcs12');
+                must<HTMLElement>(content, '#pkcs12-note').textContent = `Downloaded ${file.fileName}.`;
+            }
+            catch (problem)
+            {
+                error.textContent = errorMessage(problem);
+            }
+
+        }
+
+        /** Revoke it, for good, and why. */
+        function revokeView(Certificate: PKICertificateDetails): TemplateResult {
+
+            const isCA = Certificate.profile === 'rootCA' || Certificate.profile === 'subCA';
+
+            return html`
+                <form id="revoke-form" class="form-stack revoke" @submit=${(event: SubmitEvent) => onRevoke(event, Certificate)}>
+
+                    <h3><i class="fa-solid fa-ban"></i> Revoke</h3>
+
+                    <p class="hint">
+                        For good: it goes into the CRL of its CA, signed anew at once, and its CA's OCSP responder says "revoked"
+                        to whoever asks - also after it is deleted from this PKI. A certificate to be believed again is made anew.
+                    </p>
+
+                    <label>Why
+                        <select name="reason">
+                            ${(Object.keys(reasonWords) as RevocationReason[]).filter(reason => isCA || reason !== 'caCompromise').map(reason => html`
+                                <option value="${reason}">${reason} - ${reasonWords[reason]}</option>
+                            `)}
+                        </select>
+                    </label>
+
+                    ${Certificate.issuerKeyEncrypted ? html`
+                        <label>Password of the key of its CA
+                            <input type="password" name="issuerKeyPassword" required autocomplete="off" />
+                            <span class="hint">The CRL of '${commonNameOf(Certificate.issuerId)}' is signed with its key, which has a password.</span>
+                        </label>` : nothing}
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn danger">Revoke it</button>
+                        <span id="revoke-note"  class="form-notice" role="status"></span>
+                        <span id="revoke-error" class="form-error"  role="alert"></span>
+                    </div>
+
+                </form>
+            `;
+
+        }
+
+        function onRevoke(event: SubmitEvent, Certificate: PKICertificateDetails): void {
+
+            event.preventDefault();
+
+            const form    = event.currentTarget as HTMLFormElement;
+            const reason  = field(form, 'reason') as RevocationReason;
+
+            if (!confirm(`Revoke the ${profileWords[Certificate.profile]} '${Certificate.commonName}' for good?\n\nThis is not undone: a certificate to be believed again is made anew.`))
+                return;
+
+            const issuerKeyPassword = Certificate.issuerKeyEncrypted ? issuerPasswordOf(form) : null;
+
+            void make(form, 'revoke', () => api.pki.revoke(Certificate.id, reason, issuerKeyPassword),
+                      revoked => `Revoked the ${profileWords[revoked.profile]} '${revoked.commonName}': ${reasonWords[reason]}.` +
+                                 ((revoked as { warning?: string | null }).warning ? ` ${(revoked as { warning?: string | null }).warning}` : ''));
+
+        }
+
+        /** Sign the CRL of a CA anew, by hand: what a CA whose key has a password needs. */
+        function signCRLView(Certificate: PKICertificateDetails): TemplateResult {
+            return html`
+                <form id="sign-crl-form" class="form-stack sign-crl" @submit=${(event: SubmitEvent) => onSignCRL(event, Certificate)}>
+
+                    <h3><i class="fa-solid fa-rotate"></i> Sign its CRL anew</h3>
+
+                    <p class="hint">
+                        ${Certificate.keyEncrypted
+                              ? 'Its key has a password, so the PKI signs its CRL only where somebody gives it: now, or the next time it signs or revokes a certificate. Its OCSP responder is made anew too where that is due.'
+                              : 'The PKI signs its CRL anew by itself, before half of its time is over; this signs it now, for as long as is asked.'}
+                    </p>
+
+                    ${Certificate.keyEncrypted ? html`
+                        <label>Password of its key
+                            <input type="password" name="keyPassword" required autocomplete="off" />
+                        </label>` : nothing}
+
+                    <label>Believed for (days)
+                        <input type="number" name="validDays" min="1" max="365" placeholder="${Certificate.keyEncrypted ? (revocation?.crlValidDaysWithPassword ?? 30) : (revocation?.crlValidDays ?? 7)}" />
+                        <span class="hint">Empty for what the PKI gives a CRL of a CA like this one.</span>
+                    </label>
+
+                    ${formActions('sign-crl', 'Sign the CRL')}
+
+                </form>
+            `;
+        }
+
+        async function onSignCRL(event: SubmitEvent, Certificate: PKICertificateDetails): Promise<void> {
+
+            event.preventDefault();
+
+            const form         = event.currentTarget as HTMLFormElement;
+            const error        = must<HTMLElement>(content, '#sign-crl-error');
+            const keyPassword  = Certificate.keyEncrypted ? field(form, 'keyPassword', false) : null;
+            const validDays    = field(form, 'validDays') === '' ? null : numberField(form, 'validDays');
+
+            error.textContent = '';
+
+            try
+            {
+                const services = await whileSaving(content, must<HTMLElement>(content, '#sign-crl-note'),
+                                                   () => api.pki.signCRL(Certificate.id, keyPassword, validDays));
+                form.reset();
+                if (details !== null && details.id === Certificate.id)
+                    details = { ...details, revocationServices: services };
+                draw();
+                must<HTMLElement>(content, '#sign-crl-note').textContent = `Signed CRL number ${services.crl?.number ?? '?'}.`;
+            }
+            catch (problem)
+            {
+                error.textContent = errorMessage(problem);
+            }
 
         }
 
@@ -1174,9 +1436,12 @@ export const pkiPage: Page = {
                                                 @click=${() => { if (entry.inPKI) { show('certificates'); void open(entry.id); } }}>
                                                 <td>${entry.index}</td>
                                                 <td>${moment(entry.loggedAt)}</td>
-                                                <td><span class="chip">${profileWords[entry.profile]}</span></td>
+                                                <td><span class="chip">${entry.ocspResponder ? 'OCSP responder' : profileWords[entry.profile]}</span></td>
                                                 <td class="common-name">${entry.commonName}</td>
-                                                <td>${entry.inPKI ? html`<span class="chip ok">yes</span>` : html`<span class="chip warn">deleted</span>`}</td>
+                                                <td>${entry.ocspResponder
+                                                          ? html`<span class="muted">beside its CA</span>`
+                                                          : entry.inPKI ? html`<span class="chip ok">yes</span>` : html`<span class="chip warn">deleted</span>`}
+                                                    ${entry.revoked ? html`<span class="chip bad">revoked</span>` : nothing}</td>
                                             </tr>
                                         `)}
                                     </tbody>
@@ -1229,6 +1494,142 @@ export const pkiPage: Page = {
 
 
         // ------------------------------------------------------------------
+        // Revocation
+        // ------------------------------------------------------------------
+
+        function revocationView(): TemplateResult {
+
+            if (revocationProblem.length > 0)
+                return html`<div class="error-box">${revocationProblem}</div>`;
+
+            if (revocation === null)
+                return html`<div class="loading">Loading ...</div>`;
+
+            const overview = revocation;
+
+            return html`
+                <section class="card" id="pki-revocation">
+
+                    <h2><i class="fa-solid fa-ban"></i> Revocation</h2>
+
+                    <p class="hint">
+                        Whoever checks a certificate of this PKI asks whether it was revoked: in the CRL of its CA, or of the
+                        OCSP responder - both open to everybody, without signing in. A certificate made below a CA names
+                        where they are, once the PKI is told the address it is reached at from outside.
+                    </p>
+
+                    <form id="public-url-form" class="form-stack" @submit=${onPublicURL}>
+                        <label>The address the PKI is reached at
+                            <input name="publicURL" type="url" placeholder="http://pki.example.org" .value=${overview.publicURL ?? ''} ?disabled=${!mayMakeCAs} />
+                            <span class="hint">
+                                http rather than https serves most of whoever checks: a CRL and an OCSP response are signed. Empty for none -
+                                then certificates name no CRL and no responder. What is made already keeps what it names.
+                            </span>
+                        </label>
+                        ${mayMakeCAs ? formActions('public-url', 'Save the address') : nothing}
+                    </form>
+
+                    ${overview.ocspURL !== null ? html`
+                        <div class="kv"><span class="k">OCSP responder</span><span class="v"><code id="pki-ocsp-url">${overview.ocspURL}</code></span></div>
+                        <div class="kv"><span class="k">CRL of a CA</span><span class="v"><code>${overview.crlURL}</code></span></div>` : html`
+                        <div class="notice" id="pki-no-public-url">Certificates made now name no CRL and no OCSP responder: the PKI was told no address it is reached at.</div>`}
+
+                    <h3>The CAs</h3>
+
+                    ${overview.cas.length === 0 ? html`<p class="hint">This PKI has no CA yet.</p>` : html`
+                        <div class="table-scroll">
+                            <table class="records pki-revocation-cas">
+                                <thead><tr><th>CA</th><th>CRL</th><th>In it</th><th>Until</th><th>OCSP responder until</th><th>Signed anew</th></tr></thead>
+                                <tbody>
+                                    ${repeat(overview.cas, ca => ca.id, ca => html`
+                                        <tr data-id="${ca.id}" class="clickable" @click=${() => { show('certificates'); void open(ca.id); }}>
+                                            <td class="common-name">${ca.commonName} <span class="chip">${profileWords[ca.profile]}</span></td>
+                                            <td>${ca.crl ? `#${ca.crl.number}` : html`<span class="chip warn">none</span>`}</td>
+                                            <td>${ca.crl?.entries ?? ''}</td>
+                                            <td>${ca.crl?.nextUpdate ? moment(ca.crl.nextUpdate) : ''}</td>
+                                            <td>${ca.responder ? moment(ca.responder.notAfter) : html`<span class="chip warn">none</span>`}</td>
+                                            <td>${ca.automatic
+                                                      ? html`<span class="chip ok">by itself</span>`
+                                                      : ca.hasKey ? html`<span class="chip warn">with its password</span>` : html`<span class="muted">its key is not here</span>`}</td>
+                                        </tr>
+                                    `)}
+                                </tbody>
+                            </table>
+                        </div>`}
+
+                    <h3>Revoked</h3>
+
+                    ${overview.revoked.length === 0 ? html`<p class="hint">Nothing was revoked.</p>` : html`
+                        <div class="table-scroll">
+                            <table class="records pki-revoked">
+                                <thead><tr><th>Revoked</th><th>Common name</th><th>Below</th><th>Why</th><th>By</th></tr></thead>
+                                <tbody>
+                                    ${repeat(overview.revoked, one => one.id, one => html`
+                                        <tr data-id="${one.id}" class="${one.inPKI ? 'clickable' : ''}"
+                                            @click=${() => { if (one.inPKI) { show('certificates'); void open(one.id); } }}>
+                                            <td>${moment(one.revokedAt)}</td>
+                                            <td class="common-name">${one.commonName}${one.inPKI ? nothing : html` <span class="chip warn">deleted</span>`}</td>
+                                            <td>${one.issuer ?? ''}</td>
+                                            <td>${reasonWords[one.reason]}</td>
+                                            <td>${one.revokedBy ?? ''}</td>
+                                        </tr>
+                                    `)}
+                                </tbody>
+                            </table>
+                        </div>`}
+
+                </section>
+            `;
+
+        }
+
+        async function onPublicURL(event: SubmitEvent): Promise<void> {
+
+            event.preventDefault();
+
+            const form   = event.currentTarget as HTMLFormElement;
+            const error  = must<HTMLElement>(content, '#public-url-error');
+            const url    = field(form, 'publicURL');
+
+            error.textContent = '';
+
+            try
+            {
+                revocation = await whileSaving(content, must<HTMLElement>(content, '#public-url-note'),
+                                               () => api.pki.setPublicURL(url.length > 0 ? url : null));
+                draw();
+                must<HTMLElement>(content, '#public-url-note').textContent = 'Saved.';
+            }
+            catch (problem)
+            {
+                error.textContent = errorMessage(problem);
+            }
+
+        }
+
+        async function loadRevocation(): Promise<void> {
+
+            try
+            {
+                const loaded = await api.pki.revocation();
+                if (cancelled)
+                    return;
+                revocation         = loaded;
+                revocationProblem  = '';
+            }
+            catch (problem)
+            {
+                if (cancelled)
+                    return;
+                revocationProblem = `What the PKI revoked could not be loaded: ${errorMessage(problem)}`;
+            }
+
+            draw();
+
+        }
+
+
+        // ------------------------------------------------------------------
         // Loading
         // ------------------------------------------------------------------
 
@@ -1255,6 +1656,9 @@ export const pkiPage: Page = {
 
                 if (shown === 'transparency')
                     void loadLog();
+
+                if (shown === 'revocation')
+                    void loadRevocation();
 
             }
             catch (problem)

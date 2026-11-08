@@ -59,6 +59,7 @@ namespace cloud.charging.open.PKI
     /// | <c>POST v1/pki/certificates</c> | a new server or client certificate below a CA, with a key made here |
     /// | <c>POST v1/pki/csr</c>, <c>POST v1/pki/csr/inspect</c> | a certificate for the key of a CSR, and what a CSR says before that |
     /// | <c>v1/pki/transparency</c> | the certificate transparency log, and below it what RFC 6962 has a log answer - see PKIHTTPAPI.Transparency.cs |
+    /// | <c>.../revoke</c>, <c>.../crl</c>, <c>.../pkcs12</c>, <c>v1/pki/revocation</c>, <c>v1/pki/crl</c>, <c>v1/pki/ca</c>, <c>v1/pki/ocsp</c> | revoking, the CRLs, the OCSP responder, and PKCS#12 - see PKIHTTPAPI.Revocation.cs |
     /// </para>
     /// <para>
     /// A private key may have a password - "keyPassword" where it is made -
@@ -145,6 +146,7 @@ namespace cloud.charging.open.PKI
             AddHandler(root + "/csr/inspect",            PostCSRInspect,      HTTPMethod.POST);
 
             RegisterTransparencyURLTemplates();
+            RegisterRevocationURLTemplates();
 
         }
 
@@ -687,6 +689,20 @@ namespace cloud.charging.open.PKI
             json.Add(new JProperty("issuedCount",  PKI.Store.IssuedBy(Certificate.Id).Count));
             json.Add(new JProperty("belowCount",   Below(Certificate.Id).Count));
             json.Add(new JProperty("transparency", TransparencyJSON(Certificate)));
+            json.Add(new JProperty("revocation",   RevocationJSONOf(Certificate)));
+
+            if (Certificate.Profile.IsCA())
+                json.Add(new JProperty("revocationServices", CARevocationJSON(Certificate)));
+
+            // Whether the key of its CA - which signs the CRL it goes into -
+            // has a password a revocation has to give.
+            var issuer = Certificate.IssuerId is null || Certificate.IssuerId == Certificate.Id ? null : PKI.Store.Get(Certificate.IssuerId);
+
+            json.Add(new JProperty("issuerKeyEncrypted", issuer?.KeyEncrypted ?? false));
+            json.Add(new JProperty("mayRevoke",
+                                   Certificate.Profile != CertificateProfile.RootCA &&
+                                   Certificate.RevokedAt is null &&
+                                   PKI.IsAllowed(User, [ Permission.Edit(Certificate.Profile.IsCA() ? PKIAccess.Authorities : PKIAccess.Issuance) ])));
 
             // Said rather than left to the page to work out: the key of a CA
             // is never handed out, whoever asks.
