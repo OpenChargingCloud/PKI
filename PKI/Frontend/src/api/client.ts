@@ -322,11 +322,13 @@ export interface CSRInspection {
     signatureValid:           boolean;
 }
 
-/** What EST signs a CSR as: below which CA, as a server's or a client's certificate, for how long. */
+/** What EST signs a CSR as: below which CA, as a server's or a client's certificate, for how long - and of ISO 15118, below a CA of it. */
 export interface ESTProfile {
     issuer:     string;
     profile:    'server' | 'client';
     validDays:  number;
+    /** The domain of a certificate of ISO 15118 - what its CA signs, where it is not said - or null for one of X.509. */
+    v2g?:       V2GDomain | null;
 }
 
 /** What EST - RFC 7030, at "/.well-known/est" - signs: without a label, at each label, and whether it asks for a TLS client certificate. */

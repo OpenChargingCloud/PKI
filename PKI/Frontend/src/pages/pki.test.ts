@@ -450,8 +450,42 @@ describe('the PKI page', () => {
 
         const sent = asked.find(one => one.method === 'PUT' && one.path === '/pki/est')!.body as Record<string, unknown>;
 
-        assert.deepEqual(sent, { issuer: 'aa', profile: 'client', validDays: 365, tlsClientCertificates: false, serverKeyGeneration: false,
-                                 labels: { csms: { issuer: 'aa', profile: 'server', validDays: 365 } } });
+        assert.deepEqual(sent, { issuer: 'aa', profile: 'client', validDays: 365, v2g: null, tlsClientCertificates: false, serverKeyGeneration: false,
+                                 labels: { csms: { issuer: 'aa', profile: 'server', validDays: 365, v2g: null } } });
+
+    });
+
+    it('has EST below a CA of ISO 15118 sign what that CA signs', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA',  'rootCA', null),
+                         certificate('vv', 'CPO Sub-CA 2', 'subCA',  'aa', false, 'V2G') ];
+
+        const root = await open(pkiPage, '/pki?tab=est', everything, pki, root => root.querySelector('#est-form') !== null);
+
+        root.querySelector<HTMLButtonElement>('#est-add-label')!.click();
+
+        await until(() => root.querySelector('table.est-labels tbody tr') !== null, 'no label was added');
+
+        const label = root.querySelector<HTMLInputElement>('table.est-labels input[name="label-0"]')!;
+        label.value = 'secc';
+        label.dispatchEvent(new Event('input', { bubbles: true }));
+
+        const signedBy = root.querySelector<HTMLSelectElement>('table.est-labels select')!;
+        signedBy.value = 'vv';
+        signedBy.dispatchEvent(new Event('change', { bubbles: true }));
+
+        await until(() => root.querySelector('table.est-labels .est-v2g') !== null, 'nothing said it signs a certificate of ISO 15118');
+
+        assert.match(root.querySelector('table.est-labels .est-v2g')!.textContent!, /SECC/);
+        assert.equal(root.querySelectorAll('table.est-labels select').length, 1, 'no client or server to choose');
+
+        submit(root, '#est-form');
+
+        await until(() => asked.some(one => one.method === 'PUT' && one.path === '/pki/est'), 'nothing was saved');
+
+        const sent = asked.find(one => one.method === 'PUT' && one.path === '/pki/est')!.body as { labels: Record<string, unknown> };
+
+        assert.deepEqual(sent.labels['secc'], { issuer: 'vv', profile: 'server', validDays: 365, v2g: 'CPO' });
 
     });
 

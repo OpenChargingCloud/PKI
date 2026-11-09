@@ -17,6 +17,7 @@
 
 #region Usings
 
+using System.Formats.Asn1;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -188,6 +189,48 @@ namespace cloud.charging.open.PKI.Tests
 
         private static String Id(X509Certificate2 Certificate)
             => PKIStore.Normalized(Certificate.GetCertHashString(HashAlgorithmName.SHA256));
+
+        /// <summary>
+        /// A key of secp256r1 and a CSR for it, as a charging station makes it
+        /// for its SECC certificate: a subject without the DomainComponent, and
+        /// a name ISO 15118 has no room for.
+        /// </summary>
+        private static (ECDsa Key, Byte[] CSR) SECCKeyAndCSR(String CommonName)
+        {
+
+            var key      = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var request  = new CertificateRequest($"CN={CommonName}, O=OpenChargingCloud, C=DE", key, HashAlgorithmName.SHA256);
+            var names    = new SubjectAlternativeNameBuilder();
+            names.AddDnsName("secc.example.org");
+            request.CertificateExtensions.Add(names.Build());
+
+            return (key, request.CreateSigningRequest());
+
+        }
+
+        /// <summary>
+        /// A chain of ISO 15118 in the PKI: a V2G root and the two sub-CAs of a
+        /// charging station operator below it.
+        /// </summary>
+        private (IssuedCertificate Root, IssuedCertificate Sub1, IssuedCertificate Sub2) V2GChain()
+        {
+
+            Assert.That(pki!.Store.TryCreateRootCA(new SubjectName("V2G Root CA", "OpenChargingCloud", null, "DE"), KeyAlgorithm.ECC_P256, 3650, null, null, null,
+                                                   out var root, out var error, out _, V2GDomain.V2G), Is.True, error);
+            Assert.That(pki.Store.TryIssue(root!.Id, null, CertificateProfile.SubCA, new SubjectName("CPO Sub-CA 1", "OpenChargingCloud", null, "DE"), KeyAlgorithm.ECC_P256, 1460, [], null, null, null,
+                                           out var sub1, out error, out _, V2GDomain.V2G), Is.True, error);
+            Assert.That(pki.Store.TryIssue(sub1!.Id, null, CertificateProfile.SubCA, new SubjectName("CPO Sub-CA 2", "OpenChargingCloud", null, "DE"), KeyAlgorithm.ECC_P256, 365, [], null, null, null,
+                                           out var sub2, out error, out _, V2GDomain.V2G), Is.True, error);
+
+            return (root, sub1, sub2!);
+
+        }
+
+        private static List<String> Attributes(X500DistinguishedName Name)
+
+            => Name.EnumerateRelativeDistinguishedNames(reversed: false).
+                    Select(part => $"{part.GetSingleElementType().FriendlyName ?? part.GetSingleElementType().Value}={part.GetSingleElementValue()}").
+                    ToList();
 
         #endregion
 
@@ -569,6 +612,304 @@ namespace cloud.charging.open.PKI.Tests
             });
 
             #endregion
+
+        }
+
+        #endregion
+
+        #region AStationOfISO15118EnrollsAtItsLabel()
+
+        /// <summary>
+        /// EST below a CA of ISO 15118: a label signs what its CA signs - a SECC
+        /// certificate below one of V2G, a contract certificate below one of MO
+        /// - and says so where it is not told; it asks a CSR for a key of
+        /// secp256r1, signs it with the DomainComponent first and without the
+        /// names it asks for, and signs no other key.
+        /// </summary>
+        [Test]
+        public async Task AStationOfISO15118EnrollsAtItsLabel()
+        {
+
+            await TestPorts.StartedOnFreshPorts(() => PKIFrom());
+
+            var admin      = await Account("admin8",     "systemadmin");
+            var registrar  = await Account("registrar8", "registrar");
+
+            using var http = new HttpClient { BaseAddress = new Uri(pki!.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
+
+            var (root, _, sub2) = V2GChain();
+
+            Assert.That(pki.Store.TryCreateRootCA(new SubjectName("MO Root CA", "OpenChargingCloud", null, "DE"), KeyAlgorithm.ECC_P256, 3650, null, null, null,
+                                                  out var moRoot, out var error, out _, V2GDomain.MO), Is.True, error);
+            Assert.That(pki.Store.TryIssue(moRoot!.Id, null, CertificateProfile.SubCA, new SubjectName("MO Sub-CA 1", "OpenChargingCloud", null, "DE"), KeyAlgorithm.ECC_P256, 1460, [], null, null, null,
+                                           out var moSub, out error, out _, V2GDomain.MO), Is.True, error);
+            Assert.That(pki.Store.TryCreateRootCA(new SubjectName("X.509 Root"), KeyAlgorithm.ECC_P256, 365, null, null, null, out var plain, out error, out _), Is.True, error);
+
+            #region What EST signs, as its CAs have it
+
+            async Task<HttpResponseMessage> Put(JObject Labels)
+            {
+                var settings = new JObject(new JProperty("labels", Labels));
+                using var put = new HttpRequestMessage(HttpMethod.Put, "api/v1/pki/est") { Content = new StringContent(settings.ToString(), Encoding.UTF8, "application/json") };
+                put.Headers.Authorization = admin;
+                return await http.SendAsync(put);
+            }
+
+            JObject Label(String Issuer, params JProperty[] More)
+                => new (new[] { new JProperty("issuer", Issuer) }.Concat(More));
+
+            using var wrongDomain  = await Put(new JObject(new JProperty("secc",  Label(sub2.Id,  new JProperty("v2g", "MO")))));
+            using var notV2G       = await Put(new JObject(new JProperty("plain", Label(plain!.Id, new JProperty("v2g", "CPO")))));
+            using var wrongProfile = await Put(new JObject(new JProperty("secc",  Label(sub2.Id,  new JProperty("profile", "client")))));
+            using var saved        = await Put(new JObject(new JProperty("secc",     Label(sub2.Id,   new JProperty("validDays", 60))),
+                                                           new JProperty("contract", Label(moSub!.Id, new JProperty("validDays", 30))),
+                                                           new JProperty("plain",    Label(plain.Id))));
+
+            var labels = JObject.Parse(await saved.Content.ReadAsStringAsync())["labels"]!;
+
+            Assert.Multiple(async () => {
+                Assert.That(wrongDomain.StatusCode,                                Is.EqualTo(HttpStatusCode.BadRequest));
+                Assert.That(await wrongDomain.Content.ReadAsStringAsync(),         Does.Contain("SECC").Or.Contain("domain"));
+                Assert.That(notV2G.StatusCode,                                     Is.EqualTo(HttpStatusCode.BadRequest), "nothing of ISO 15118 below a CA of X.509");
+                Assert.That(wrongProfile.StatusCode,                               Is.EqualTo(HttpStatusCode.BadRequest), "below a V2G CA, a client's certificate is nothing of ISO 15118");
+                Assert.That(saved.StatusCode,                                      Is.EqualTo(HttpStatusCode.OK), await saved.Content.ReadAsStringAsync());
+                Assert.That(labels["secc"]!["v2g"]!.Value<String>(),               Is.EqualTo("CPO"),    "what its CA signs, where it says nothing");
+                Assert.That(labels["secc"]!["profile"]!.Value<String>(),           Is.EqualTo("server"));
+                Assert.That(labels["contract"]!["v2g"]!.Value<String>(),           Is.EqualTo("MO"));
+                Assert.That(labels["contract"]!["profile"]!.Value<String>(),       Is.EqualTo("client"));
+                Assert.That(labels["plain"]!["v2g"]!.Type,                         Is.EqualTo(JTokenType.Null));
+            });
+
+            #endregion
+
+            #region What a CSR is asked for
+
+            using var seccAttributes   = await http.GetAsync(".well-known/est/secc/csrattrs");
+            using var plainAttributes  = await http.GetAsync(".well-known/est/plain/csrattrs");
+
+            Assert.That(seccAttributes.StatusCode,                                 Is.EqualTo(HttpStatusCode.OK));
+            Assert.That(seccAttributes.Content.Headers.ContentType?.MediaType,     Is.EqualTo("application/csrattrs"));
+            Assert.That(plainAttributes.StatusCode,                                Is.EqualTo(HttpStatusCode.NoContent));
+
+            var asked   = new AsnReader(Convert.FromBase64String(await seccAttributes.Content.ReadAsStringAsync()), AsnEncodingRules.DER).ReadSequence();
+            var hash    = asked.ReadObjectIdentifier();
+            var keyOf   = asked.ReadSequence();
+            var keyType = keyOf.ReadObjectIdentifier();
+            var curve   = keyOf.ReadSetOf().ReadObjectIdentifier();
+
+            Assert.Multiple(() => {
+                Assert.That(hash,     Is.EqualTo("1.2.840.10045.4.3.2"), "ecdsa-with-SHA256");
+                Assert.That(keyType,  Is.EqualTo("1.2.840.10045.2.1"),   "id-ecPublicKey");
+                Assert.That(curve,    Is.EqualTo("1.2.840.10045.3.1.7"), "secp256r1");
+            });
+
+            #endregion
+
+            #region A SECC certificate and a contract certificate, enrolled
+
+            async Task<HttpResponseMessage> Enroll(String Path, Byte[] CSR)
+            {
+                using var post = new HttpRequestMessage(HttpMethod.Post, Path) { Content = AsPKCS10(CSR) };
+                post.Headers.Authorization = registrar;
+                return await http.SendAsync(post);
+            }
+
+            var (seccKey, seccCSR) = SECCKeyAndCSR("DE*ABC*E1234567*1");
+
+            using (seccKey)
+            {
+
+                using var enrolled  = await Enroll(".well-known/est/secc/simpleenroll", seccCSR);
+
+                Assert.That(enrolled.StatusCode, Is.EqualTo(HttpStatusCode.OK), await enrolled.Content.ReadAsStringAsync());
+
+                using var secc      = (await CertificatesOf(enrolled)).Single();
+                using var publicKey = secc.GetECDsaPublicKey()!;
+                var kept            = pki.Store.Get(Id(secc))!;
+
+                Assert.Multiple(() => {
+                    Assert.That(Attributes(secc.SubjectName).Count,                    Is.EqualTo(4), "the DomainComponent, and the subject of the CSR");
+                    Assert.That(Attributes(secc.SubjectName)[0],                       Does.EndWith("=CPO"), "the DomainComponent first");
+                    Assert.That(secc.GetNameInfo(X509NameType.SimpleName, false),      Is.EqualTo("DE*ABC*E1234567*1"));
+                    Assert.That(secc.Extensions["2.5.29.17"],                          Is.Null, "no names in ISO 15118, whatever the CSR asks for");
+                    Assert.That(secc.Extensions.OfType<X509KeyUsageExtension>().Single().KeyUsages,
+                                                                                       Is.EqualTo(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyAgreement));
+                    Assert.That(secc.RawData.Length,                                   Is.LessThanOrEqualTo(800));
+                    Assert.That(publicKey.ExportSubjectPublicKeyInfo(),                Is.EqualTo(seccKey.ExportSubjectPublicKeyInfo()));
+                    Assert.That(kept.V2G,                                              Is.EqualTo(V2GDomain.CPO));
+                    Assert.That(kept.Profile,                                          Is.EqualTo(CertificateProfile.Server));
+                    Assert.That(kept.IssuerId,                                         Is.EqualTo(sub2.Id));
+                });
+
+            }
+
+            var (contractKey, contractCSR) = SECCKeyAndCSR("DEABCC12345678");
+
+            using (contractKey)
+            {
+
+                using var enrolled  = await Enroll(".well-known/est/contract/simpleenroll", contractCSR);
+
+                Assert.That(enrolled.StatusCode, Is.EqualTo(HttpStatusCode.OK), await enrolled.Content.ReadAsStringAsync());
+
+                using var contract  = (await CertificatesOf(enrolled)).Single();
+
+                Assert.Multiple(() => {
+                    Assert.That(Attributes(contract.SubjectName)[0],                   Does.EndWith("=MO"));
+                    Assert.That(pki.Store.Get(Id(contract))!.V2G,                      Is.EqualTo(V2GDomain.MO));
+                    Assert.That(contract.Extensions.OfType<X509KeyUsageExtension>().Single().KeyUsages,
+                                                                                       Is.EqualTo(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.NonRepudiation |
+                                                                                                  X509KeyUsageFlags.KeyEncipherment  | X509KeyUsageFlags.KeyAgreement));
+                });
+
+            }
+
+            #endregion
+
+            #region No other key, and no other domain
+
+            using var rsaKey    = RSA.Create(2048);
+            var rsaCSR          = new CertificateRequest("CN=DE*ABC*E7654321*1", rsaKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1).CreateSigningRequest();
+
+            using var p384Key   = ECDsa.Create(ECCurve.NamedCurves.nistP384);
+            var p384CSR         = new CertificateRequest("CN=DE*ABC*E7654321*2", p384Key, HashAlgorithmName.SHA384).CreateSigningRequest();
+
+            using var otherDC   = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var otherDCCSR      = new CertificateRequest("DC=MO, CN=DE*ABC*E7654321*3", otherDC, HashAlgorithmName.SHA256).CreateSigningRequest();
+
+            using var rsa       = await Enroll(".well-known/est/secc/simpleenroll", rsaCSR);
+            using var p384      = await Enroll(".well-known/est/secc/simpleenroll", p384CSR);
+            using var wrongDC   = await Enroll(".well-known/est/secc/simpleenroll", otherDCCSR);
+
+            Assert.Multiple(() => {
+                Assert.That(rsa.StatusCode,                                        Is.EqualTo(HttpStatusCode.BadRequest), "no RSA in ISO 15118-2");
+                Assert.That(p384.StatusCode,                                       Is.EqualTo(HttpStatusCode.BadRequest), "no P-384 in ISO 15118-2");
+                Assert.That(wrongDC.StatusCode,                                    Is.EqualTo(HttpStatusCode.BadRequest), "a CSR of another domain");
+                Assert.That(pki.Store.Find("DE*ABC*E7654321*1"),                   Is.Empty);
+            });
+
+            #endregion
+
+        }
+
+        #endregion
+
+        #region ASECCRenewsItselfAndIsGivenAKeyOfISO15118()
+
+        /// <summary>
+        /// Over HTTPS: a SECC certificate renews itself at its label for a CSR
+        /// that does not name its domain, and serverkeygen makes a key of
+        /// secp256r1 for it, whatever the CSR was signed with.
+        /// </summary>
+        [Test]
+        public async Task ASECCRenewsItselfAndIsGivenAKeyOfISO15118()
+        {
+
+            #region A PKI of HTTPS, a V2G chain, and EST at "secc"
+
+            using var webKey   = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var webRequest     = new CertificateRequest("CN=PKI web interface", webKey, HashAlgorithmName.SHA256);
+            var webNames       = new SubjectAlternativeNameBuilder();
+            webNames.AddIpAddress(System.Net.IPAddress.Loopback);
+            webRequest.CertificateExtensions.Add(webNames.Build());
+
+            using var web      = webRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+            var webFile        = Path.Combine(directory, "web.p12");
+            File.WriteAllBytes(webFile, web.Export(X509ContentType.Pkcs12));
+
+            await TestPorts.StartedOnFreshPorts(() => PKIFrom(NodeArguments.Parse([ "--https", "--import-certificate", $"tlsServerIdentity={webFile}" ])));
+
+            var (_, _, sub2) = V2GChain();
+
+            Assert.That(pki!.TrySetEST(new ESTSettings(null, new Dictionary<String, ESTProfile> { ["secc"] = new ESTProfile(sub2.Id, CertificateProfile.Server, 60) }, true, ServerKeyGeneration: true),
+                                       out var error), Is.True, error);
+            Assert.That(pki.EST.For("secc")!.V2G, Is.EqualTo(V2GDomain.CPO), "what its CA signs");
+
+            var registrar = await Account("registrar9", "registrar");
+
+            #endregion
+
+            #region The station's first SECC certificate
+
+            var (key, csr) = SECCKeyAndCSR("DE*ABC*E1234567*9");
+
+            Assert.That(pki.Store.TryIssueFromCSR(sub2.Id, null, CertificateProfile.Server, Convert.ToBase64String(csr), 60, [], true, null, null,
+                                                  out var first, out error, out _, V2GDomain.CPO), Is.True, error);
+
+            using var withKey  = pki.Store.Load(first!.Id)!.CopyWithPrivateKey(key);
+            using var station  = X509CertificateLoader.LoadPkcs12(withKey.Export(X509ContentType.Pkcs12, "station"), "station", X509KeyStorageFlags.Exportable);
+
+            HttpClient AsStation(X509Certificate2? ClientCertificate)
+            {
+                var handler = new HttpClientHandler {
+                                  ClientCertificateOptions                   = ClientCertificateOption.Manual,
+                                  ServerCertificateCustomValidationCallback  = (message, served, chain, errors) => true
+                              };
+                if (ClientCertificate is not null)
+                    handler.ClientCertificates.Add(ClientCertificate);
+                return new HttpClient(handler) { BaseAddress = new Uri(pki.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
+            }
+
+            #endregion
+
+            #region Renewed with itself, for a CSR without its domain
+
+            var (newKey, newCSR) = SECCKeyAndCSR("DE*ABC*E1234567*9");
+
+            using var asStation  = AsStation(station);
+            using var renewed    = await asStation.PostAsync(".well-known/est/secc/simplereenroll", AsPKCS10(newCSR));
+
+            Assert.That(renewed.StatusCode, Is.EqualTo(HttpStatusCode.OK), await renewed.Content.ReadAsStringAsync());
+
+            using var second     = (await CertificatesOf(renewed)).Single();
+
+            Assert.Multiple(() => {
+                Assert.That(second.SubjectName.Name,                               Is.EqualTo(pki.Store.Load(first.Id)!.SubjectName.Name));
+                Assert.That(pki.Store.Get(Id(second))!.V2G,                        Is.EqualTo(V2GDomain.CPO));
+                Assert.That(pki.Store.Get(Id(second))!.CreatedBy,                  Does.Contain(first.Id));
+            });
+
+            #endregion
+
+            #region A key of secp256r1 made, for a CSR signed with RSA
+
+            using var csrKey  = RSA.Create(2048);
+            var rsaCSR        = new CertificateRequest("CN=DE*ABC*E1234567*10, O=OpenChargingCloud, C=DE", csrKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1).CreateSigningRequest();
+
+            using var nobody  = AsStation(null);
+            using var post    = new HttpRequestMessage(HttpMethod.Post, ".well-known/est/secc/serverkeygen") { Content = AsPKCS10(rsaCSR) };
+            post.Headers.Authorization = registrar;
+
+            using var made    = await nobody.SendAsync(post);
+
+            Assert.That(made.StatusCode, Is.EqualTo(HttpStatusCode.OK), await made.Content.ReadAsStringAsync());
+
+            var boundary  = made.Content.Headers.ContentType!.Parameters.Single(parameter => parameter.Name == "boundary").Value!.Trim('"');
+            var parts     = (await made.Content.ReadAsStringAsync()).
+                                Split("--" + boundary).
+                                Select(part => part.Trim()).
+                                Where (part => part.Length > 0 && part != "--").
+                                Select(part => part.Split("\r\n\r\n", 2)).
+                                ToDictionary(part => part[0].Split("\r\n").Single(line => line.StartsWith("Content-Type:")).Split(':', 2)[1].Trim(),
+                                             part => Convert.FromBase64String(part[1].Trim()));
+
+            using var madeKey      = ECDsa.Create();
+            madeKey.ImportPkcs8PrivateKey(parts["application/pkcs8"], out _);
+
+            using var certificate  = PKCS7.ReadCertsOnly(parts["application/pkcs7-mime; smime-type=certs-only"]).Single();
+            using var publicKey    = certificate.GetECDsaPublicKey()!;
+
+            Assert.Multiple(() => {
+                Assert.That(madeKey.ExportParameters(false).Curve.Oid.Value,       Is.EqualTo("1.2.840.10045.3.1.7"), "secp256r1");
+                Assert.That(publicKey.ExportSubjectPublicKeyInfo(),                Is.EqualTo(madeKey.ExportSubjectPublicKeyInfo()));
+                Assert.That(Attributes(certificate.SubjectName)[0],                Does.EndWith("=CPO"));
+                Assert.That(pki.Store.Get(Id(certificate))!.V2G,                   Is.EqualTo(V2GDomain.CPO));
+            });
+
+            #endregion
+
+            key.Dispose();
+            newKey.Dispose();
 
         }
 

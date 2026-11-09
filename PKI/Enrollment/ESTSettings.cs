@@ -31,31 +31,50 @@ namespace cloud.charging.open.PKI.Enrollment
 
     /// <summary>
     /// What EST signs a CSR as: below which CA, as a server's or a client's
-    /// certificate, and for how long.
+    /// certificate, for how long - and as one of ISO 15118, below a CA of it.
     /// </summary>
     /// <param name="IssuerId">The CA that signs, by its fingerprint.</param>
     /// <param name="Profile">A server's or a client's certificate.</param>
     /// <param name="ValidDays">For how many days what it signs holds.</param>
+    /// <param name="V2G">The domain of a certificate of ISO 15118 - a SECC certificate of CPO, say - or null for one of X.509.</param>
     public sealed record ESTProfile(String              IssuerId,
                                     CertificateProfile  Profile,
-                                    Int32               ValidDays)
+                                    Int32               ValidDays,
+                                    V2GDomain?          V2G = null)
     {
+
+        /// <summary>
+        /// What it signs, in words: "a client's certificate", "SECC certificate".
+        /// </summary>
+        public String InWords
+
+            => V2G is V2GDomain domain
+                   ? ISO15118.InWords(Profile, domain)
+                   : Profile.InWords();
 
         public JObject ToJSON()
 
             => new (
                    new JProperty("issuer",     IssuerId),
                    new JProperty("profile",    Profile.AsText()),
-                   new JProperty("validDays",  ValidDays)
+                   new JProperty("validDays",  ValidDays),
+                   new JProperty("v2g",        V2G?.AsText())
                );
 
         /// <summary>
         /// One profile of EST from its JSON, or why it is none.
         /// </summary>
-        public static Boolean TryParse(JToken?                                JSON,
-                                       String                                 Where,
-                                       [NotNullWhen(true)]  out ESTProfile?   Profile,
-                                       [NotNullWhen(false)] out String?       Error)
+        /// <remarks>
+        /// Below a CA of ISO 15118, where the CA is known, a profile that names
+        /// neither "v2g" nor "profile" is what that CA signs: a SECC certificate
+        /// below one of V2G, the certificate of its own domain below every other.
+        /// </remarks>
+        /// <param name="CA">The CA of this PKI with the given fingerprint, where there is one.</param>
+        public static Boolean TryParse(JToken?                                  JSON,
+                                       String                                   Where,
+                                       [NotNullWhen(true)]  out ESTProfile?     Profile,
+                                       [NotNullWhen(false)] out String?         Error,
+                                       Func<String, IssuedCertificate?>?        CA = null)
         {
 
             Profile  = null;
@@ -63,7 +82,7 @@ namespace cloud.charging.open.PKI.Enrollment
 
             if (JSON is not JObject json)
             {
-                Error = $"{Where} is {{ \"issuer\", \"profile\", \"validDays\" }}.";
+                Error = $"{Where} is {{ \"issuer\", \"profile\", \"validDays\", \"v2g\" }}.";
                 return false;
             }
 
@@ -75,10 +94,30 @@ namespace cloud.charging.open.PKI.Enrollment
                 return false;
             }
 
-            if (!CertificateProfileExtensions.TryParse(json.Value<String>("profile") ?? "client", out var profile) ||
+            V2GDomain? v2g = null;
+
+            if (json["v2g"] is JToken v2gToken && v2gToken.Type != JTokenType.Null &&
+                (v2gToken.Type != JTokenType.String || !ISO15118.TryParse(v2gToken.Value<String>(), out v2g)))
+            {
+                Error = $"The \"v2g\" of {Where} is the domain of a certificate of ISO 15118 - \"CPO\", \"MO\", \"OEM\" or \"CPS\" - or null.";
+                return false;
+            }
+
+            if (v2g is null && CA?.Invoke(issuer)?.V2G is V2GDomain issuerDomain)
+                v2g = ISO15118.LeafDomainBelow(issuerDomain);
+
+            var profileText = json.Value<String>("profile") ?? (v2g is V2GDomain leaf ? ISO15118.LeafProfileOf(leaf).AsText() : "client");
+
+            if (!CertificateProfileExtensions.TryParse(profileText, out var profile) ||
                 profile is not (CertificateProfile.Server or CertificateProfile.Client))
             {
                 Error = $"The \"profile\" of {Where} is \"server\" or \"client\": EST makes no CA.";
+                return false;
+            }
+
+            if (v2g is V2GDomain domain && !ISO15118.IsAllowed(profile.Value, domain, out var why))
+            {
+                Error = $"{Where}: {why}";
                 return false;
             }
 
@@ -91,7 +130,7 @@ namespace cloud.charging.open.PKI.Enrollment
                 return false;
             }
 
-            Profile = new ESTProfile(issuer, profile.Value, days);
+            Profile = new ESTProfile(issuer, profile.Value, days, v2g);
             return true;
 
         }
@@ -108,13 +147,16 @@ namespace cloud.charging.open.PKI.Enrollment
     /// <code>
     /// "est": {
     ///   "issuer": "&lt;fingerprint of a CA&gt;", "profile": "client", "validDays": 365,
-    ///   "labels": { "csms": { "issuer": "...", "profile": "server", "validDays": 365 } },
+    ///   "labels": { "csms": { "issuer": "...", "profile": "server", "validDays": 365 },
+    ///               "secc": { "issuer": "&lt;fingerprint of a CPO sub-CA&gt;", "v2g": "CPO", "validDays": 365 } },
     ///   "tlsClientCertificates": true, "serverKeyGeneration": false
     /// }
     /// </code>
     /// A request at "/.well-known/est/simpleenroll" is signed as the section
     /// itself says, one at "/.well-known/est/csms/simpleenroll" as its label
     /// "csms" says. Without an issuer, and without labels, EST signs nothing.
+    /// Below a CA of ISO 15118, EST signs certificates of ISO 15118 - "v2g"
+    /// says which, and where it does not, the CA does.
     /// With "serverKeyGeneration", "serverkeygen" makes the key as well, for
     /// whoever cannot make one of its own.
     /// </remarks>
@@ -180,9 +222,11 @@ namespace cloud.charging.open.PKI.Enrollment
         /// The settings from the "est" of the "pki" section - none, where it says
         /// nothing - or why they are none.
         /// </summary>
+        /// <param name="CA">The CA of this PKI with the given fingerprint, where there is one: what EST signs below a CA of ISO 15118, where the JSON does not say it.</param>
         public static Boolean TryParse(JToken?                                 JSON,
                                        [NotNullWhen(true)]  out ESTSettings?   Settings,
-                                       [NotNullWhen(false)] out String?        Error)
+                                       [NotNullWhen(false)] out String?        Error,
+                                       Func<String, IssuedCertificate?>?       CA = null)
         {
 
             Settings  = null;
@@ -196,14 +240,14 @@ namespace cloud.charging.open.PKI.Enrollment
 
             if (JSON is not JObject json)
             {
-                Error = "\"est\" is { \"issuer\", \"profile\", \"validDays\", \"labels\", \"tlsClientCertificates\", \"serverKeyGeneration\" }.";
+                Error = "\"est\" is { \"issuer\", \"profile\", \"validDays\", \"v2g\", \"labels\", \"tlsClientCertificates\", \"serverKeyGeneration\" }.";
                 return false;
             }
 
             ESTProfile? @default = null;
 
             if (!String.IsNullOrWhiteSpace(json.Value<String>("issuer")) &&
-                !ESTProfile.TryParse(json, "\"est\"", out @default, out Error))
+                !ESTProfile.TryParse(json, "\"est\"", out @default, out Error, CA))
             {
                 return false;
             }
@@ -215,7 +259,7 @@ namespace cloud.charging.open.PKI.Enrollment
 
                 if (labelsToken is not JObject labelsJSON)
                 {
-                    Error = "The \"labels\" of \"est\" are { \"<label>\": { \"issuer\", \"profile\", \"validDays\" } }.";
+                    Error = "The \"labels\" of \"est\" are { \"<label>\": { \"issuer\", \"profile\", \"validDays\", \"v2g\" } }.";
                     return false;
                 }
 
@@ -228,7 +272,7 @@ namespace cloud.charging.open.PKI.Enrollment
                         return false;
                     }
 
-                    if (!ESTProfile.TryParse(label.Value, $"the label '{label.Name}'", out var profile, out Error))
+                    if (!ESTProfile.TryParse(label.Value, $"the label '{label.Name}'", out var profile, out Error, CA))
                         return false;
 
                     labels[label.Name] = profile;

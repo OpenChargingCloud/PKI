@@ -325,7 +325,7 @@ namespace cloud.charging.open.PKI
 
             if (document?[ConfigSection] is JObject estSection)
             {
-                if (ESTSettings.TryParse(estSection["est"], out var est, out var estError))
+                if (ESTSettings.TryParse(estSection["est"], out var est, out var estError, Store.Get))
                     ApplyEST(est);
                 else
                     this.Log.Warning($"PKI: the \"est\" of the \"{ConfigSection}\" section of '{this.ConfigFile.Path}' was passed over, and EST signs nothing: {estError}", "pki", "est", "configuration");
@@ -450,25 +450,86 @@ namespace cloud.charging.open.PKI
         /// <remarks>
         /// A CA that is not one of this PKI is refused; one whose key has a
         /// password, or is not here, is taken, and signs nothing over EST until
-        /// that changes - which the JSON API says beside it.
+        /// that changes - which the JSON API says beside it. Below a CA of ISO
+        /// 15118, EST signs what that CA signs, a SECC certificate below one
+        /// of V2G, and nothing of X.509; below a CA of X.509, nothing of ISO
+        /// 15118.
         /// </remarks>
         public Boolean TrySetEST(ESTSettings                       Settings,
                                  [NotNullWhen(false)] out String?  Error)
         {
 
-            foreach (var issuerId in new[] { Settings.Default?.IssuerId }.Concat(Settings.Labels.Values.Select(profile => profile.IssuerId)).OfType<String>())
+            ESTProfile? @default = null;
+
+            if (Settings.Default is not null &&
+                !TryESTBelow(Settings.Default, "without a label", out @default, out Error))
             {
-                if (Store.Get(issuerId) is not IssuedCertificate ca || !ca.Profile.IsCA())
-                {
-                    Error = $"There is no CA '{issuerId}' in this PKI to sign over EST.";
-                    return false;
-                }
+                return false;
             }
+
+            var labels = new Dictionary<String, ESTProfile>(StringComparer.Ordinal);
+
+            foreach (var label in Settings.Labels)
+            {
+
+                if (!TryESTBelow(label.Value, $"at the label '{label.Key}'", out var profile, out Error))
+                    return false;
+
+                labels[label.Key] = profile;
+
+            }
+
+            Settings = Settings with { Default = @default, Labels = labels };
 
             if (!ConfigFile.TryMergeSection(ConfigSection, new JObject(new JProperty("est", Settings.ToJSON())), out Error))
                 return false;
 
             ApplyEST(Settings);
+            return true;
+
+        }
+
+        /// <summary>
+        /// What EST signs below its CA, as that CA has it: of ISO 15118 below
+        /// a CA of ISO 15118 - of the domain it says, or of the one that CA
+        /// signs where it says none - and of X.509 below every other.
+        /// </summary>
+        private Boolean TryESTBelow(ESTProfile                                Profile,
+                                    String                                    Where,
+                                    [NotNullWhen(true)]  out ESTProfile?      Resolved,
+                                    [NotNullWhen(false)] out String?          Error)
+        {
+
+            Resolved = null;
+
+            if (Store.Get(Profile.IssuerId) is not IssuedCertificate ca || !ca.Profile.IsCA())
+            {
+                Error = $"There is no CA '{Profile.IssuerId}' in this PKI to sign over EST.";
+                return false;
+            }
+
+            if (ca.V2G is not V2GDomain issuerDomain)
+            {
+
+                Error = Profile.V2G is null
+                            ? null
+                            : $"EST {Where} signs no {Profile.InWords} below '{ca.CommonName}', which is a CA of X.509 and not of ISO 15118.";
+
+                Resolved = Error is null ? Profile : null;
+                return Error is null;
+
+            }
+
+            var domain = Profile.V2G ?? ISO15118.LeafDomainBelow(issuerDomain);
+
+            if (!ISO15118.IsAllowed(Profile.Profile, domain, out Error) ||
+                !ISO15118.MaySignBelow(ca, issuerDomain, Profile.Profile, domain, out Error))
+            {
+                Error = $"EST {Where}: {Error}";
+                return false;
+            }
+
+            Resolved = Profile with { V2G = domain };
             return true;
 
         }

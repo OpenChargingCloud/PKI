@@ -704,6 +704,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// <param name="ValidDays">For how many days from now it holds; no longer than its CA.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
         /// <param name="PrivateKey">The key made, as PKCS#8 DER.</param>
+        /// <param name="V2G">The domain of a certificate of ISO 15118 - whose key is ECC P-256 whatever the request was signed with; null for none of ISO 15118.</param>
         public Boolean TryIssueWithKeyFor(String                                        IssuerId,
                                           String?                                       IssuerKeyPassword,
                                           CertificateProfile                            Profile,
@@ -713,7 +714,8 @@ namespace cloud.charging.open.PKI.Issuance
                                           [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                           [NotNullWhen(true)]  out Byte[]?              PrivateKey,
                                           [NotNullWhen(false)] out String?              Error,
-                                          out Boolean                                   NotSaved)
+                                          out Boolean                                   NotSaved,
+                                          V2GDomain?                                    V2G = null)
         {
 
             Certificate  = null;
@@ -727,17 +729,23 @@ namespace cloud.charging.open.PKI.Issuance
             }
 
             if (!TryLoadCSR(CSR, out var request, out Error, SkipSignature: true) ||
-                !TryNamesOf(request, Profile, [], true, true, out var commonName, out var names, out Error))
+                !TrySubjectOf(request.SubjectName, V2G, out var subject, out Error) ||
+                !TryNamesOf(request, Profile, [], V2G is null, V2G is null, out var commonName, out var names, out Error))
             {
                 return false;
             }
 
-            var keyAlgorithm = KeyAlgorithm.Of(request.PublicKey) ?? KeyAlgorithm.ECC_P256;
+            var keyAlgorithm = V2G is not null
+                                   ? ISO15118.KeyAlgorithm
+                                   : KeyAlgorithm.Of(request.PublicKey) ?? KeyAlgorithm.ECC_P256;
+
+            if (!ISO15118IsFine(Profile, V2G, keyAlgorithm, out Error))
+                return false;
 
             using var key = keyAlgorithm.NewKey();
 
-            if (!TrySign(IssuerId, IssuerKeyPassword, Profile, request.SubjectName, commonName, new PublicKey(key), key, null,
-                         ValidDays, names, null, false, CreatedBy, null,
+            if (!TrySign(IssuerId, IssuerKeyPassword, Profile, subject, commonName, new PublicKey(key), key, null,
+                         ValidDays, names, null, false, CreatedBy, V2G,
                          out Certificate, out Error, out NotSaved))
             {
                 return false;

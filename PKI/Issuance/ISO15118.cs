@@ -177,6 +177,17 @@ namespace cloud.charging.open.PKI.Issuance
                    ? CertificateProfile.Server
                    : CertificateProfile.Client;
 
+        /// <summary>
+        /// The domain of a certificate of a server or a client below a CA of
+        /// the given domain: a SECC's, CPO, below one of V2G, and the CA's own
+        /// below every other.
+        /// </summary>
+        public static V2GDomain LeafDomainBelow(V2GDomain IssuerDomain)
+
+            => IssuerDomain == V2GDomain.V2G
+                   ? V2GDomain.CPO
+                   : IssuerDomain;
+
         #endregion
 
         #region IsAllowed(Profile, Domain, out Error)

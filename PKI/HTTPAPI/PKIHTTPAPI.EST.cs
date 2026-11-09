@@ -17,6 +17,7 @@
 
 #region Usings
 
+using System.Formats.Asn1;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -49,7 +50,7 @@ namespace cloud.charging.open.PKI
     /// | <c>POST /.well-known/est[/&lt;label&gt;]/simpleenroll</c> | a CSR signed: a PKCS#10 in Base64 in, the certificate as a certs-only PKCS#7 in Base64 out |
     /// | <c>POST /.well-known/est[/&lt;label&gt;]/simplereenroll</c> | the same, for whoever renews a certificate of this PKI |
     /// | <c>POST /.well-known/est[/&lt;label&gt;]/serverkeygen</c> | where it is allowed, and over HTTPS only: a CSR's subject and names signed for a key made here, and the key with the certificate, as multipart/mixed |
-    /// | <c>GET /.well-known/est[/&lt;label&gt;]/csrattrs</c> | 204: nothing in particular is asked of a CSR |
+    /// | <c>GET /.well-known/est[/&lt;label&gt;]/csrattrs</c> | below a CA of ISO 15118, a key of secp256r1 and ECDSA with SHA-256; 204 otherwise: nothing in particular is asked of a CSR |
     /// | <c>GET v1/pki/est</c>, <c>PUT v1/pki/est</c> | what EST signs, and whether a TLS client certificate is asked for |
     /// </para>
     /// <para>
@@ -66,6 +67,14 @@ namespace cloud.charging.open.PKI
     /// for - its subject and its names are taken, nothing else, as at "Sign a
     /// CSR". The CA signs without anybody there, so a CA whose key has a
     /// password signs nothing over EST.
+    /// </para>
+    /// <para>
+    /// Below a CA of ISO 15118, EST signs what that CA signs - a SECC
+    /// certificate below one of V2G, the certificate of its own domain below
+    /// every other - with the DomainComponent first in its subject, without
+    /// the names the CSR asks for, and for a key of secp256r1 only, which
+    /// "csrattrs" asks for: where a CSMS sends the CSR of a charging
+    /// station's V2GCertificate, OCPP 2.0.1.
     /// </para>
     /// <para>
     /// "serverkeygen" is for a station that cannot make a key of its own: the
@@ -93,6 +102,8 @@ namespace cloud.charging.open.PKI
         private static readonly String           PKCS7ContentTypeText   = "application/pkcs7-mime; smime-type=certs-only";
 
         private static readonly HTTPContentType  MultipartContentType   = ContentType("multipart/mixed");
+
+        private static readonly HTTPContentType  CSRAttributesContentType = ContentType("application/csrattrs");
 
         #endregion
 
@@ -165,7 +176,7 @@ namespace cloud.charging.open.PKI
             if (!TryParseJSONObject(Request, out var json, out var errorResponse))
                 return Task.FromResult(errorResponse);
 
-            if (!ESTSettings.TryParse(json, out var settings, out var error) ||
+            if (!ESTSettings.TryParse(json, out var settings, out var error, PKI.Store.Get) ||
                 !PKI.TrySetEST(settings, out error))
             {
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, error));
@@ -211,7 +222,7 @@ namespace cloud.charging.open.PKI
             => String.Join("; ", new[] { (Label: (String?) null, Profile: Settings.Default) }.
                                      Concat(Settings.Labels.Select(label => (Label: (String?) label.Key, Profile: (ESTProfile?) label.Value))).
                                      Where (one => one.Profile is not null).
-                                     Select(one => $"{(one.Label is null ? "without a label" : $"'{one.Label}'")} as a {one.Profile!.Profile.InWords()} of {one.Profile.ValidDays} days below '{PKI.Store.Get(one.Profile.IssuerId)?.CommonName ?? one.Profile.IssuerId}'"));
+                                     Select(one => $"{(one.Label is null ? "without a label" : $"'{one.Label}'")} as a {one.Profile!.InWords} of {one.Profile.ValidDays} days below '{PKI.Store.Get(one.Profile.IssuerId)?.CommonName ?? one.Profile.IssuerId}'"));
 
         /// <summary>
         /// Why the given CA signs nothing over EST, or null where it does.
@@ -279,19 +290,62 @@ namespace cloud.charging.open.PKI
         #region (private) ESTCSRAttributes(Request)
 
         /// <summary>
-        /// GET /.well-known/est[/label]/csrattrs: 204 - nothing in particular
-        /// is asked of a CSR, RFC 7030, section 4.5.2.
+        /// GET /.well-known/est[/label]/csrattrs: what is asked of a CSR, RFC
+        /// 7030, section 4.5.2 - for a certificate of ISO 15118, a key of
+        /// secp256r1 and a signature of ECDSA with SHA-256; for every other,
+        /// nothing in particular, 204.
         /// </summary>
         private Task<HTTPResponse> ESTCSRAttributes(HTTPRequest Request)
+        {
 
-            => Task.FromResult(
-                   PKI.EST.For(LabelOf(Request)) is null
-                       ? ESTError(Request, HTTPStatusCode.NotFound, NoEST(Request))
-                       : new HTTPResponse.Builder(Request) {
-                             HTTPStatusCode  = HTTPStatusCode.NoContent,
-                             CacheControl    = "no-store"
-                         }.WithCommonSecurityHeaders().AsImmutable
-               );
+            var profile = PKI.EST.For(LabelOf(Request));
+
+            if (profile is null)
+                return Task.FromResult(ESTError(Request, HTTPStatusCode.NotFound, NoEST(Request)));
+
+            if (profile.V2G is null)
+                return Task.FromResult(new HTTPResponse.Builder(Request) {
+                                           HTTPStatusCode  = HTTPStatusCode.NoContent,
+                                           CacheControl    = "no-store"
+                                       }.WithCommonSecurityHeaders().AsImmutable);
+
+            return Task.FromResult(new HTTPResponse.Builder(Request) {
+                                       HTTPStatusCode  = HTTPStatusCode.OK,
+                                       ContentType     = CSRAttributesContentType,
+                                       Content         = Encoding.ASCII.GetBytes(Convert.ToBase64String(ISO15118CSRAttributes(), Base64FormattingOptions.InsertLineBreaks) + "\r\n"),
+                                       CacheControl    = "no-store"
+                                   }.Set("Content-Transfer-Encoding", "base64").
+                                     WithCommonSecurityHeaders().AsImmutable);
+
+        }
+
+        /// <summary>
+        /// The CsrAttrs of RFC 7030, section 4.5.2, that ask for what ISO
+        /// 15118-2 signs: ecdsa-with-SHA256, and an id-ecPublicKey of secp256r1
+        /// - as the example of RFC 7030, section 4.5.2, asks for P-384.
+        /// </summary>
+        private static Byte[] ISO15118CSRAttributes()
+        {
+
+            var writer = new AsnWriter(AsnEncodingRules.DER);
+
+            using (writer.PushSequence())
+            {
+
+                writer.WriteObjectIdentifier("1.2.840.10045.4.3.2");          // ecdsa-with-SHA256
+
+                using (writer.PushSequence())
+                {
+                    writer.WriteObjectIdentifier("1.2.840.10045.2.1");        // id-ecPublicKey
+                    using (writer.PushSetOf())
+                        writer.WriteObjectIdentifier("1.2.840.10045.3.1.7");  // secp256r1
+                }
+
+            }
+
+            return writer.Encode();
+
+        }
 
         #endregion
 
@@ -405,16 +459,20 @@ namespace cloud.charging.open.PKI
 
                 using var current  = PKI.Store.Load(renewed.Id)!;
 
-                var sameNames      = new HashSet<String>(inspection.SubjectAlternativeNames, StringComparer.OrdinalIgnoreCase).
+                // A certificate of ISO 15118 has no other names, and the
+                // DomainComponent first in its subject, where the CSR may
+                // name none: it is renewed for the subject it would be given.
+                var sameNames      = profile.V2G is not null ||
+                                     new HashSet<String>(inspection.SubjectAlternativeNames, StringComparer.OrdinalIgnoreCase).
                                          SetEquals(AlternativeNames.Of(current));
 
-                if (inspection.Subject != current.SubjectName.Name || !sameNames)
+                if (SubjectAsSigned(inspection.Subject, profile.V2G) != current.SubjectName.Name || !sameNames)
                     return ESTError(Request, HTTPStatusCode.BadRequest,
                                     "A certificate is renewed for the subject and the names it has: the CSR asks for others.");
 
-                if (renewed.Profile != profile.Profile)
+                if (renewed.Profile != profile.Profile || renewed.V2G != profile.V2G)
                     return ESTError(Request, HTTPStatusCode.BadRequest,
-                                    $"The {renewed.Profile.InWords()} '{renewed.CommonName}' is not renewed as a {profile.Profile.InWords()}{(label is null ? "" : $" at the label '{label}'")}.");
+                                    $"The {renewed.InWords} '{renewed.CommonName}' is not renewed as a {profile.InWords}{(label is null ? "" : $" at the label '{label}'")}.");
 
             }
 
@@ -431,9 +489,9 @@ namespace cloud.charging.open.PKI
 
             var signed      = ServerKeyGen
                                   ? PKI.Store.TryIssueWithKeyFor(profile.IssuerId, null, profile.Profile, csr, profile.ValidDays, createdBy,
-                                                                 out certificate, out privateKey, out error, out notSaved)
+                                                                 out certificate, out privateKey, out error, out notSaved, profile.V2G)
                                   : PKI.Store.TryIssueFromCSR   (profile.IssuerId, null, profile.Profile, csr, profile.ValidDays, [], true, null, createdBy,
-                                                                 out certificate, out error, out notSaved);
+                                                                 out certificate, out error, out notSaved, profile.V2G);
 
             if (!signed || certificate is null)
                 return ESTError(Request, notSaved ? HTTPStatusCode.InternalServerError : HTTPStatusCode.BadRequest, error ?? "Nothing was signed.");
@@ -455,6 +513,30 @@ namespace cloud.charging.open.PKI
 
 
         #region (private) What EST shares
+
+        /// <summary>
+        /// The subject of a CSR as the certificate is signed with it: for one
+        /// of ISO 15118, with the DomainComponent of its domain first.
+        /// </summary>
+        private static String SubjectAsSigned(String      Subject,
+                                              V2GDomain?  V2G)
+        {
+
+            if (V2G is not V2GDomain domain)
+                return Subject;
+
+            try
+            {
+                return ISO15118.TryWithDomainComponent(new X500DistinguishedName(Subject), domain, out var withIt, out _)
+                           ? withIt.Name
+                           : Subject;
+            }
+            catch (CryptographicException)
+            {
+                return Subject;
+            }
+
+        }
 
         private static String? LabelOf(HTTPRequest Request)
 
