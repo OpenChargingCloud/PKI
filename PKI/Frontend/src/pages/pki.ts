@@ -2,6 +2,8 @@ import { api,
          apiURL,
          type CertificateProfile,
          type CSRInspection,
+         type ESTOverview,
+         type ESTProfile,
          type LogEntry,
          type PKICertificate,
          type PKICertificateDetails,
@@ -40,6 +42,10 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  * Revocation tab says where certificates find them, and how each CA's CRL and
  * responder stand. A server's or a client's certificate goes out with its key
  * as a PKCS#12 file too.
+ *
+ * The EST tab says what the EST server of RFC 7030 signs - a CSR a charging
+ * station sends, signed without anybody here - below which CA and as what,
+ * without a label and at each label.
  *
  * A key made here may be given a password, and need not. A CA whose key has
  * one signs only where its password is given again, so a form shows the field
@@ -181,10 +187,11 @@ export const pkiPage: Page = {
             { id: 'issue',         label: 'New certificate',  icon: 'fa-file-signature' },
             { id: 'csr',           label: 'Sign a CSR',       icon: 'fa-file-import'    },
             { id: 'transparency',  label: 'Transparency log', icon: 'fa-scroll'         },
-            { id: 'revocation',    label: 'Revocation',       icon: 'fa-ban'            }
+            { id: 'revocation',    label: 'Revocation',       icon: 'fa-ban'            },
+            { id: 'est',           label: 'EST',              icon: 'fa-robot'          }
         ];
 
-        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency' || tab.id === 'revocation'
+        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency' || tab.id === 'revocation' || tab.id === 'est'
                                         || ((tab.id === 'root-ca' || tab.id === 'sub-ca') && mayMakeCAs)
                                         ||  (tab.id === 'issue'                          && maySign)
                                         ||  (tab.id === 'csr'                            && (maySign || mayMakeCAs)));
@@ -219,6 +226,11 @@ export const pkiPage: Page = {
         let revocation:      RevocationOverview | null     = null;
         let revocationProblem                              = '';
 
+        /** What EST signs, and the labels of the form as they are being edited. */
+        let est:             ESTOverview | null            = null;
+        let estProblem                                     = '';
+        let estLabels:       (ESTProfile & { label: string })[] = [];
+
         /** The CA each form has chosen to sign, by the id of the form; its first where none was. */
         const issuerChosen: Record<string, string> = {};
 
@@ -237,6 +249,8 @@ export const pkiPage: Page = {
                 void loadLog();
             if (id === 'revocation')
                 void loadRevocation();
+            if (id === 'est')
+                void loadEST();
         }
 
         /** Every certificate, or those the filter lets through. */
@@ -306,6 +320,10 @@ export const pkiPage: Page = {
 
                 <section class="tab-panel" role="tabpanel" id="panel-revocation" aria-labelledby="tab-revocation" ?hidden=${shown !== 'revocation'}>
                     ${revocationView()}
+                </section>
+
+                <section class="tab-panel" role="tabpanel" id="panel-est" aria-labelledby="tab-est" ?hidden=${shown !== 'est'}>
+                    ${estView(pki)}
                 </section>
 
             `);
@@ -1630,6 +1648,199 @@ export const pkiPage: Page = {
 
 
         // ------------------------------------------------------------------
+        // EST
+        // ------------------------------------------------------------------
+
+        /** Where a client of EST is pointed: the server of this page, at "/.well-known/est". */
+        function estAddress(Overview: ESTOverview): string {
+            return `${location.origin}${Overview.path}`;
+        }
+
+        /** The CAs EST may sign with: every CA of the PKI. */
+        function estIssuerOptions(pki: PKICertificates, Chosen: string | undefined): TemplateResult {
+            return html`${pki.certificates.filter(certificate => certificate.profile === 'rootCA' || certificate.profile === 'subCA').map(ca => html`
+                <option value="${ca.id}" ?selected=${ca.id === Chosen}>${ca.commonName} - ${profileWords[ca.profile]}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
+            `)}`;
+        }
+
+        function estView(pki: PKICertificates): TemplateResult {
+
+            if (estProblem.length > 0)
+                return html`<div class="error-box">${estProblem}</div>`;
+
+            if (est === null)
+                return html`<div class="loading">Loading ...</div>`;
+
+            const overview  = est;
+            const address   = estAddress(overview);
+
+            return html`
+                <section class="card" id="pki-est">
+
+                    <h2><i class="fa-solid fa-robot"></i> Enrollment over Secure Transport</h2>
+
+                    <p class="hint">
+                        EST of RFC 7030 signs the CSR of a charging station - or of whatever asks - without anybody here:
+                        as what it is told below, whatever the CSR asks for. Who enrolls signs in with an API key or HTTP Basic,
+                        as an account that may sign certificates of servers and clients - a backend in the <code>registrar</code> role,
+                        say. A CA whose key has a password signs nothing over EST.
+                    </p>
+
+                    <div class="kv"><span class="k">Address</span><span class="v"><code id="pki-est-address">${address}</code></span></div>
+                    <div class="kv"><span class="k">Signs</span><span class="v" id="pki-est-state">${overview.enabled
+                        ? html`<span class="chip ok">yes</span>`
+                        : html`<span class="chip warn">nothing</span> <span class="muted">until it is told a CA</span>`}</span></div>
+
+                    ${overview.issuers.filter(issuer => issuer.problem !== null).map(issuer => html`
+                        <div class="notice est-problem">'${issuer.commonName ?? issuer.id}' signs nothing over EST: ${issuer.problem}</div>
+                    `)}
+
+                    <form id="est-form" class="form-stack" @submit=${onEST}>
+
+                        <h3>Without a label - <code>${overview.path}/simpleenroll</code></h3>
+
+                        <div class="est-profile">
+                            <label>Signed by
+                                <select name="issuer" ?disabled=${!mayMakeCAs}>
+                                    <option value="" ?selected=${overview.issuer === undefined}>nobody - nothing is signed without a label</option>
+                                    ${estIssuerOptions(pki, overview.issuer)}
+                                </select>
+                            </label>
+                            <label>As
+                                <select name="profile" ?disabled=${!mayMakeCAs}>
+                                    <option value="client" ?selected=${overview.profile !== 'server'}>client</option>
+                                    <option value="server" ?selected=${overview.profile === 'server'}>server</option>
+                                </select>
+                            </label>
+                            <label>Valid for (days)
+                                <input type="number" name="validDays" min="1" max="${pki.maxValidityDays}" value="${overview.validDays ?? 365}" ?disabled=${!mayMakeCAs} />
+                            </label>
+                        </div>
+
+                        <h3>Labels - <code>${overview.path}/&lt;label&gt;/simpleenroll</code></h3>
+
+                        ${estLabels.length === 0 ? html`<p class="hint">No label.</p>` : html`
+                            <div class="table-scroll">
+                                <table class="records est-labels">
+                                    <thead><tr><th>Label</th><th>Signed by</th><th>As</th><th>Days</th><th></th></tr></thead>
+                                    <tbody>
+                                        ${estLabels.map((row, at) => html`
+                                            <tr data-label="${row.label}">
+                                                <td><input name="label-${at}" .value=${row.label} required pattern="[A-Za-z0-9][A-Za-z0-9_\\-]{0,63}" aria-label="Label" ?disabled=${!mayMakeCAs}
+                                                           @input=${(event: Event) => { row.label = (event.currentTarget as HTMLInputElement).value; }} /></td>
+                                                <td><select aria-label="Signed by" ?disabled=${!mayMakeCAs}
+                                                            @change=${(event: Event) => { row.issuer = (event.currentTarget as HTMLSelectElement).value; }}>
+                                                        ${estIssuerOptions(pki, row.issuer)}
+                                                    </select></td>
+                                                <td><select aria-label="As" ?disabled=${!mayMakeCAs}
+                                                            @change=${(event: Event) => { row.profile = (event.currentTarget as HTMLSelectElement).value as 'server' | 'client'; }}>
+                                                        <option value="client" ?selected=${row.profile === 'client'}>client</option>
+                                                        <option value="server" ?selected=${row.profile === 'server'}>server</option>
+                                                    </select></td>
+                                                <td><input type="number" min="1" max="${pki.maxValidityDays}" .value=${String(row.validDays)} aria-label="Days" ?disabled=${!mayMakeCAs}
+                                                           @input=${(event: Event) => { row.validDays = Number((event.currentTarget as HTMLInputElement).value); }} /></td>
+                                                <td>${mayMakeCAs ? html`<button type="button" class="btn small danger" @click=${() => { estLabels.splice(at, 1); draw(); }}>Remove</button>` : nothing}</td>
+                                            </tr>
+                                        `)}
+                                    </tbody>
+                                </table>
+                            </div>`}
+
+                        ${mayMakeCAs ? html`
+                            <div>
+                                <button type="button" class="btn small" id="est-add-label"
+                                        @click=${() => { estLabels.push({ label: '', issuer: est?.issuer ?? pki.certificates.find(one => one.profile === 'subCA' || one.profile === 'rootCA')?.id ?? '', profile: 'client', validDays: 365 }); draw(); }}>
+                                    <i class="fa-solid fa-plus"></i> Add a label
+                                </button>
+                            </div>` : nothing}
+
+                        <label class="checkbox">
+                            <input type="checkbox" name="tlsClientCertificates" ?checked=${overview.tlsClientCertificates} ?disabled=${!mayMakeCAs} />
+                            Ask for a TLS client certificate: a certificate of this PKI renews itself at <code>simplereenroll</code>, nobody signed in
+                        </label>
+                        <span class="hint">
+                            ${overview.https
+                                  ? 'Asked for, never demanded. A browser that has certificates of its own may ask which one to show.'
+                                  : 'Only where the PKI speaks HTTPS of its own: behind a proxy that ends TLS, the station renews with an API key.'}
+                        </span>
+
+                        ${mayMakeCAs ? formActions('est', 'Save') : nothing}
+
+                    </form>
+
+                </section>
+            `;
+
+        }
+
+        async function onEST(event: SubmitEvent): Promise<void> {
+
+            event.preventDefault();
+
+            const form   = event.currentTarget as HTMLFormElement;
+            const error  = must<HTMLElement>(content, '#est-error');
+
+            error.textContent = '';
+
+            const issuer   = field(form, 'issuer', false);
+            const labels:  Record<string, ESTProfile> = {};
+
+            for (const row of estLabels) {
+                if (row.label.trim().length === 0) {
+                    error.textContent = 'Every label has a name.';
+                    return;
+                }
+                labels[row.label.trim()] = { issuer: row.issuer, profile: row.profile, validDays: row.validDays };
+            }
+
+            const settings = {
+                ...(issuer.length > 0 ? { issuer, profile: field(form, 'profile') as 'server' | 'client', validDays: numberField(form, 'validDays') } : {}),
+                labels,
+                tlsClientCertificates: isChecked(form, 'tlsClientCertificates')
+            };
+
+            try
+            {
+                const saved = await whileSaving(content, must<HTMLElement>(content, '#est-note'), () => api.pki.setEST(settings));
+                takeEST(saved);
+                draw();
+                must<HTMLElement>(content, '#est-note').textContent = 'Saved.';
+            }
+            catch (problem)
+            {
+                error.textContent = errorMessage(problem);
+            }
+
+        }
+
+        function takeEST(Overview: ESTOverview): void {
+            est        = Overview;
+            estLabels  = Object.entries(Overview.labels).map(([ label, profile ]) => ({ label, ...profile }));
+        }
+
+        async function loadEST(): Promise<void> {
+
+            try
+            {
+                const loaded = await api.pki.est();
+                if (cancelled)
+                    return;
+                takeEST(loaded);
+                estProblem = '';
+            }
+            catch (problem)
+            {
+                if (cancelled)
+                    return;
+                estProblem = `What EST signs could not be loaded: ${errorMessage(problem)}`;
+            }
+
+            draw();
+
+        }
+
+
+        // ------------------------------------------------------------------
         // Loading
         // ------------------------------------------------------------------
 
@@ -1659,6 +1870,9 @@ export const pkiPage: Page = {
 
                 if (shown === 'revocation')
                     void loadRevocation();
+
+                if (shown === 'est')
+                    void loadEST();
 
             }
             catch (problem)

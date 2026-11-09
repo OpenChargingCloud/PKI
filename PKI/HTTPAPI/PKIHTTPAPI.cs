@@ -59,6 +59,7 @@ namespace cloud.charging.open.PKI
     /// | <c>POST v1/pki/certificates</c> | a new server or client certificate below a CA, with a key made here |
     /// | <c>POST v1/pki/csr</c>, <c>POST v1/pki/csr/inspect</c> | a certificate for the key of a CSR, and what a CSR says before that |
     /// | <c>v1/pki/transparency</c> | the certificate transparency log, and below it what RFC 6962 has a log answer - see PKIHTTPAPI.Transparency.cs |
+    /// | <c>v1/pki/est</c>, and <c>/.well-known/est</c> of the HTTP server | enrollment over secure transport, RFC 7030 - see PKIHTTPAPI.EST.cs |
     /// | <c>.../revoke</c>, <c>.../crl</c>, <c>.../pkcs12</c>, <c>v1/pki/revocation</c>, <c>v1/pki/crl</c>, <c>v1/pki/ca</c>, <c>v1/pki/ocsp</c> | revoking, the CRLs, the OCSP responder, and PKCS#12 - see PKIHTTPAPI.Revocation.cs |
     /// </para>
     /// <para>
@@ -147,6 +148,7 @@ namespace cloud.charging.open.PKI
 
             RegisterTransparencyURLTemplates();
             RegisterRevocationURLTemplates();
+            RegisterESTURLTemplates();
 
         }
 

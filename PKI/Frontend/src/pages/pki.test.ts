@@ -79,6 +79,13 @@ function pki({ method, path, body }: Asked): unknown {
     if (method === 'GET' && path === '/pki/revocation')
         return revocationOverview();
 
+    if (method === 'GET' && path === '/pki/est')
+        return { issuer: 'aa', profile: 'client', validDays: 365, labels: {}, tlsClientCertificates: false,
+                 enabled: true, path: '/.well-known/est', https: false, issuers: [ { id: 'aa', commonName: 'OCC Root CA', problem: null } ] };
+
+    if (method === 'PUT' && path === '/pki/est')
+        return { ...(body as Record<string, unknown>), enabled: true, path: '/.well-known/est', https: false, issuers: [] };
+
     const revoke = /^\/pki\/certificates\/([0-9a-f]+)\/revoke$/.exec(path);
 
     if (method === 'POST' && revoke !== null) {
@@ -410,6 +417,39 @@ describe('the PKI page', () => {
 
     });
 
+    it('says what EST signs, and saves a label added', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null),
+                         certificate('ab', 'OCC Sub CA',  'subCA',  'aa') ];
+
+        const root = await open(pkiPage, '/pki?tab=est', everything, pki, root => root.querySelector('#est-form') !== null);
+
+        assert.match(root.querySelector('#pki-est-address')!.textContent!, /\/\.well-known\/est$/);
+        assert.equal(field(root, '#est-form', 'issuer').value, 'aa');
+
+        root.querySelector<HTMLButtonElement>('#est-add-label')!.click();
+
+        await until(() => root.querySelector('table.est-labels tbody tr') !== null, 'no label was added');
+
+        const label = root.querySelector<HTMLInputElement>('table.est-labels input[name="label-0"]')!;
+        label.value = 'csms';
+        label.dispatchEvent(new Event('input', { bubbles: true }));
+
+        const as = root.querySelectorAll<HTMLSelectElement>('table.est-labels select')[1]!;
+        as.value = 'server';
+        as.dispatchEvent(new Event('change', { bubbles: true }));
+
+        submit(root, '#est-form');
+
+        await until(() => asked.some(one => one.method === 'PUT' && one.path === '/pki/est'), 'nothing was saved');
+
+        const sent = asked.find(one => one.method === 'PUT' && one.path === '/pki/est')!.body as Record<string, unknown>;
+
+        assert.deepEqual(sent, { issuer: 'aa', profile: 'client', validDays: 365, tlsClientCertificates: false,
+                                 labels: { csms: { issuer: 'aa', profile: 'server', validDays: 365 } } });
+
+    });
+
     it('offers no form to an account that may sign nothing', async () => {
 
         certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null) ];
@@ -418,8 +458,8 @@ describe('the PKI page', () => {
                                 root => root.querySelector('table.pki-list') !== null);
 
         assert.equal(root.querySelector('form'), null);
-        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency', 'tab-revocation' ],
-                         'the list, the log and what was revoked, which are read as the list is');
+        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency', 'tab-revocation', 'tab-est' ],
+                         'the list, the log, what was revoked and what EST signs, which are read as the list is');
         assert.match(root.querySelector('.notice')!.textContent!, /may look at the certificates of this PKI but not sign any/);
 
     });

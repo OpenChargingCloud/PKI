@@ -92,6 +92,8 @@ table.records.pki-list {
 
 // A password for a key and the same again: side by side where there is room,
 // as the subject's fields are.
+// What EST signs without a label: three fields in a row, as the passwords.
+.est-profile,
 .key-password-fields {
 
     display:                grid;

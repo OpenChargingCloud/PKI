@@ -304,6 +304,29 @@ export interface CSRInspection {
     signatureValid:           boolean;
 }
 
+/** What EST signs a CSR as: below which CA, as a server's or a client's certificate, for how long. */
+export interface ESTProfile {
+    issuer:     string;
+    profile:    'server' | 'client';
+    validDays:  number;
+}
+
+/** What EST - RFC 7030, at "/.well-known/est" - signs: without a label, at each label, and whether it asks for a TLS client certificate. */
+export interface ESTSettings extends Partial<ESTProfile> {
+    labels:                 Record<string, ESTProfile>;
+    tlsClientCertificates:  boolean;
+}
+
+/** The settings, and what the PKI says of them. */
+export interface ESTOverview extends ESTSettings {
+    enabled:  boolean;
+    path:     string;
+    /** Whether the PKI speaks HTTPS of its own - where alone it can ask for a TLS client certificate. */
+    https:    boolean;
+    /** Each CA EST signs with, and why it signs nothing, where it does not. */
+    issuers:  { id: string; commonName: string | null; problem: string | null }[];
+}
+
 /** What a deletion took with it. */
 export interface PKIDeleted {
     deleted:  string[];
@@ -339,7 +362,9 @@ export const api = {
         pkcs12:      (id: string, keyPassword: string | null, pkcs12Password: string, legacy: boolean) =>
                                                           request<{ id: string; fileName: string; pkcs12: string; legacy: boolean }>('POST', `${pki(id)}/pkcs12`, { keyPassword, pkcs12Password, legacy }),
         revocation:  ()                                => request<RevocationOverview>    ('GET',    '/pki/revocation'),
-        setPublicURL: (publicURL: string | null)       => request<RevocationOverview>    ('PUT',    '/pki/revocation', { publicURL })
+        setPublicURL: (publicURL: string | null)       => request<RevocationOverview>    ('PUT',    '/pki/revocation', { publicURL }),
+        est:         ()                                => request<ESTOverview>           ('GET',    '/pki/est'),
+        setEST:      (settings: ESTSettings)           => request<ESTOverview>           ('PUT',    '/pki/est', settings)
     }
 
 };

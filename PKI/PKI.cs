@@ -32,6 +32,7 @@ using cloud.charging.open.protocols.WWCP.Node.Certificates;
 using cloud.charging.open.protocols.WWCP.Node.Configuration;
 using cloud.charging.open.protocols.WWCP.Node.SecureShell;
 
+using cloud.charging.open.PKI.Enrollment;
 using cloud.charging.open.PKI.Issuance;
 using cloud.charging.open.PKI.Revocation;
 
@@ -160,6 +161,12 @@ namespace cloud.charging.open.PKI
         /// The certificates this PKI made, and what makes more of them.
         /// </summary>
         public PKIStore    Store  { get; }
+
+        /// <summary>
+        /// What the EST server at "/.well-known/est" signs - see
+        /// <see cref="ESTSettings"/>.
+        /// </summary>
+        public ESTSettings EST    { get; private set; } = ESTSettings.None;
 
         #endregion
 
@@ -293,7 +300,9 @@ namespace cloud.charging.open.PKI
             // The address the PKI is reached at, from the "pki" section: what
             // every certificate made below a CA names as where its CRL and its
             // OCSP responder are.
-            if (this.ConfigFile.TryLoadDocument(out var document, out _) &&
+            this.ConfigFile.TryLoadDocument(out var document, out _);
+
+            if (document is not null &&
                 document[ConfigSection] is JObject section &&
                 section.Value<String>("publicURL") is String publicURL)
             {
@@ -309,6 +318,26 @@ namespace cloud.charging.open.PKI
                           "pki", "security");
 
             RefreshRevocation();
+
+            #endregion
+
+            #region What EST signs
+
+            if (document?[ConfigSection] is JObject estSection)
+            {
+                if (ESTSettings.TryParse(estSection["est"], out var est, out var estError))
+                    ApplyEST(est);
+                else
+                    this.Log.Warning($"PKI: the \"est\" of the \"{ConfigSection}\" section of '{this.ConfigFile.Path}' was passed over, and EST signs nothing: {estError}", "pki", "est", "configuration");
+            }
+
+            this.Log.Info(EST.Enabled
+                              ? $"EST at {ESTPathAt()} signs CSRs{(EST.Default is null ? "" : " without a label")}{(EST.Labels.Count > 0 ? $"{(EST.Default is null ? "" : " and")} at the label(s) {String.Join(", ", EST.Labels.Keys.Select(label => $"'{label}'"))}" : "")}" +
+                                (EST.TLSClientCertificates
+                                     ? HTTPS ? ", and asks for a TLS client certificate to renew." : "; it asks for no TLS client certificate, since the PKI speaks no HTTPS of its own."
+                                     : ".")
+                              : $"EST at {ESTPathAt()} signs nothing: the \"{ConfigSection}\" section of the configuration file names no CA for it.",
+                          "pki", "est");
 
             #endregion
 
@@ -408,6 +437,68 @@ namespace cloud.charging.open.PKI
             }
 
         }
+
+        #endregion
+
+        #region TrySetEST(Settings, out Error)
+
+        /// <summary>
+        /// What the EST server signs from now on - kept in the "est" of the "pki"
+        /// section of the configuration file.
+        /// </summary>
+        /// <remarks>
+        /// A CA that is not one of this PKI is refused; one whose key has a
+        /// password, or is not here, is taken, and signs nothing over EST until
+        /// that changes - which the JSON API says beside it.
+        /// </remarks>
+        public Boolean TrySetEST(ESTSettings                       Settings,
+                                 [NotNullWhen(false)] out String?  Error)
+        {
+
+            foreach (var issuerId in new[] { Settings.Default?.IssuerId }.Concat(Settings.Labels.Values.Select(profile => profile.IssuerId)).OfType<String>())
+            {
+                if (Store.Get(issuerId) is not IssuedCertificate ca || !ca.Profile.IsCA())
+                {
+                    Error = $"There is no CA '{issuerId}' in this PKI to sign over EST.";
+                    return false;
+                }
+            }
+
+            if (!ConfigFile.TryMergeSection(ConfigSection, new JObject(new JProperty("est", Settings.ToJSON())), out Error))
+                return false;
+
+            ApplyEST(Settings);
+            return true;
+
+        }
+
+        /// <summary>
+        /// The settings of EST taken - and a TLS client certificate asked for,
+        /// or not any more, by the HTTPS server of the PKI's own.
+        /// </summary>
+        /// <remarks>
+        /// Asked for and never demanded: the handshake takes whatever certificate
+        /// comes, or none, and EST judges it for what it renews. A browser that
+        /// has certificates of its own may ask which one to show.
+        /// </remarks>
+        private void ApplyEST(ESTSettings Settings)
+        {
+
+            EST = Settings;
+
+            if (HTTPS)
+                HTTPServer.ClientCertificateValidator = Settings.TLSClientCertificates
+                                                            ? (sender, certificate, chain, server, errors) => TLSValidationResult.Success()
+                                                            : null;
+
+        }
+
+        /// <summary>
+        /// Where the EST server is, as a client would be pointed at it.
+        /// </summary>
+        public String ESTPathAt()
+
+            => new Uri(WebInterfaceURL.ToString()).GetLeftPart(UriPartial.Authority) + PKIHTTPAPI.ESTPath;
 
         #endregion
 
