@@ -11,7 +11,8 @@ import { api,
          type RevocationOverview,
          type RevocationReason,
          type SubjectName,
-         type TransparencyLog }  from '../api/client';
+         type TransparencyLog,
+         type V2GDomain }        from '../api/client';
 import { auth } from '../auth';
 import { must } from '@node/html';
 import { appendText, pemBox } from '@node/pemBox';
@@ -45,7 +46,15 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  *
  * The EST tab says what the EST server of RFC 7030 signs - a CSR a charging
  * station sends, signed without anybody here - below which CA and as what,
- * without a label and at each label.
+ * without a label and at each label; and whether it makes the key of a station
+ * that cannot make its own.
+ *
+ * A root CA may be one of ISO 15118-2, Plug & Charge: a V2G, MO or OEM root.
+ * Below it the forms make certificates of ISO 15118 only - the domain of a
+ * sub-CA chosen, that of a SECC, contract, OEM provisioning or CPS certificate
+ * following from its CA - each with the key and the extensions ISO 15118-2
+ * has, and nothing else. A server's or a client's certificate otherwise
+ * carries the signed certificate timestamp of the transparency log in itself.
  *
  * A key made here may be given a password, and need not. A CA whose key has
  * one signs only where its password is given again, so a form shows the field
@@ -60,6 +69,61 @@ const profileWords: Record<CertificateProfile, string> = {
     server:  'server',
     client:  'client'
 };
+
+/** What a certificate of ISO 15118 is called, by its profile and its domain. */
+function v2gWords(Profile: CertificateProfile, Domain: V2GDomain): string {
+
+    if (Profile === 'rootCA')
+        return `${Domain} root CA`;
+
+    if (Profile === 'subCA')
+        return `${Domain} sub-CA`;
+
+    switch (Domain) {
+        case 'CPO':  return 'SECC';
+        case 'MO':   return 'contract';
+        case 'OEM':  return 'OEM provisioning';
+        case 'CPS':  return 'CPS';
+        default:     return `${Domain} ${profileWords[Profile]}`;
+    }
+
+}
+
+/** What a certificate is on its chip: its profile - or what ISO 15118 calls it. */
+function kindOf(Certificate: { profile: CertificateProfile; v2g: V2GDomain | null }): string {
+    return Certificate.v2g ? v2gWords(Certificate.profile, Certificate.v2g) : profileWords[Certificate.profile];
+}
+
+/** The roots of ISO 15118, and what each is for. */
+const v2gRoots: [ V2GDomain, string ][] = [
+    [ 'V2G', 'a V2G root - charging station operators and their SECC certificates below it' ],
+    [ 'MO',  'an MO root - mobility operators and their contract certificates'              ],
+    [ 'OEM', 'an OEM root - car makers and the provisioning certificates of their cars'     ]
+];
+
+/** The domain of a certificate for a server or a client below a CA of ISO 15118: a SECC's below V2G, the CA's own below every other. */
+function leafDomainBelow(Domain: V2GDomain): V2GDomain {
+    return Domain === 'V2G' ? 'CPO' : Domain;
+}
+
+/** What that certificate is, said in a form. */
+function leafWords(Domain: V2GDomain): string {
+    switch (Domain) {
+        case 'CPO':  return 'a SECC certificate - the charging station towards the car';
+        case 'MO':   return 'a contract certificate';
+        case 'OEM':  return 'an OEM provisioning certificate';
+        default:     return 'the certificate of the certificate provisioning service';
+    }
+}
+
+/** The domains a sub-CA may have below a CA of ISO 15118: any but CPO below a V2G root, the CA's own below every other. */
+function subCADomainsBelow(Issuer: PKICertificate): V2GDomain[] {
+    return Issuer.v2g === null
+               ? []
+               : Issuer.profile === 'rootCA' && Issuer.v2g === 'V2G'
+                     ? [ 'V2G', 'MO', 'OEM', 'CPS' ]
+                     : [ Issuer.v2g ];
+}
 
 /** "ecc-p256" as a person reads it: "ECC P-256". */
 function keyName(Algorithm: string): string {
@@ -234,6 +298,9 @@ export const pkiPage: Page = {
         /** The CA each form has chosen to sign, by the id of the form; its first where none was. */
         const issuerChosen: Record<string, string> = {};
 
+        /** Whether the root CA of the form is one of ISO 15118, and of which domain. */
+        let rootV2G:        V2GDomain | ''                 = '';
+
         /** What the CSR in its box says, once the PKI has been asked. */
         let csrPreview:     CSRInspection | null           = null;
         let csrProblem                                     = '';
@@ -374,7 +441,7 @@ export const pkiPage: Page = {
                                               ${repeat(shownNow, certificate => certificate.id, certificate => html`
                                                   <tr data-id="${certificate.id}" class="${certificate.id === openId ? 'open' : ''}"
                                                       @click=${() => void open(certificate.id === openId ? null : certificate.id)}>
-                                                      <td><span class="chip">${profileWords[certificate.profile]}</span></td>
+                                                      <td><span class="chip ${certificate.v2g ? 'on' : ''}" title="${certificate.v2g ? 'ISO 15118-2' : ''}">${kindOf(certificate)}</span></td>
                                                       <td class="common-name">${certificate.commonName}</td>
                                                       <td>${certificate.issuerId === null ? html`<span class="muted">itself</span>` : commonNameOf(certificate.issuerId) || html`<span class="muted">${certificate.issuer}</span>`}</td>
                                                       <td>${day(certificate.notAfter)}</td>
@@ -428,7 +495,8 @@ export const pkiPage: Page = {
 
                     <h2><i class="fa-solid ${isCA ? 'fa-sitemap' : 'fa-file-contract'}"></i> ${certificate.commonName}</h2>
 
-                    <div class="kv"><span class="k">Profile</span><span class="v">${profileWords[certificate.profile]}${certificate.fromCSR ? ', signed for a CSR' : ''}</span></div>
+                    <div class="kv"><span class="k">Profile</span><span class="v" id="pki-details-profile">${kindOf(certificate)}${certificate.fromCSR ? ', signed for a CSR' : ''}
+                        ${certificate.v2g ? html`<span class="chip on">ISO 15118-2, domain ${certificate.v2g}</span>` : nothing}</span></div>
                     <div class="kv"><span class="k">Subject</span><span class="v"><code>${certificate.subject}</code></span></div>
                     <div class="kv"><span class="k">Chain</span><span class="v">
                         ${certificate.chain.map((step, at) => html`${at > 0 ? html`<i class="fa-solid fa-arrow-left chain-step muted"></i>` : nothing}<button type="button" class="btn small chain-step" ?disabled=${step.id === certificate.id} @click=${() => void open(step.id)}>${step.commonName}</button>`)}
@@ -447,7 +515,8 @@ export const pkiPage: Page = {
                     <div class="kv"><span class="k">Serial number</span><span class="v"><code>${certificate.serialNumber}</code></span></div>
                     <div class="kv"><span class="k">SHA-256</span><span class="v fingerprint">${inPairs(certificate.id)}</span></div>
                     <div class="kv"><span class="k">Transparency log</span><span class="v" id="pki-details-log">${certificate.transparency
-                        ? html`entry #${certificate.transparency.index}, since ${moment(certificate.transparency.loggedAt)}`
+                        ? html`entry #${certificate.transparency.index}, since ${moment(certificate.transparency.loggedAt)}${certificate.transparency.embedded
+                                  ? html` - <span class="chip ok">its timestamp in the certificate</span>` : nothing}`
                         : html`<span class="muted">not in it</span>`}</span></div>
                     <div class="kv"><span class="k">Made</span><span class="v">${moment(certificate.createdAt)}${certificate.createdBy !== null ? ` by ${certificate.createdBy}` : ''}</span></div>
                     ${certificate.revocation ? html`
@@ -917,7 +986,7 @@ export const pkiPage: Page = {
                     <select name="issuer" required
                             @change=${(event: Event) => { issuerChosen[FormId] = (event.currentTarget as HTMLSelectElement).value; draw(); }}>
                         ${repeat(signers(pki.certificates, ForACA), ca => ca.id, ca => html`
-                            <option value="${ca.id}" ?selected=${ca.id === chosen?.id}>${ca.commonName} - ${profileWords[ca.profile]}, until ${day(ca.notAfter)}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
+                            <option value="${ca.id}" ?selected=${ca.id === chosen?.id}>${ca.commonName} - ${kindOf(ca)}, until ${day(ca.notAfter)}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
                         `)}
                     </select>
                     <span class="hint">A CA of this PKI that is valid now and whose key is here.</span>
@@ -969,6 +1038,11 @@ export const pkiPage: Page = {
         function issuerPasswordOf(Form: HTMLFormElement): string | null {
             const password = field(Form, 'issuerKeyPassword', false);
             return password.length > 0 ? password : null;
+        }
+
+        /** What the key of a certificate of ISO 15118 is, said where the form would ask for one. */
+        function v2gKeyNote(): TemplateResult {
+            return html`<p class="hint v2g-key">Its key is ECC P-256, and every signature ECDSA with SHA-256: the one ISO 15118-2 has.</p>`;
         }
 
         /** What a form says where there is nothing to sign with yet. */
@@ -1060,7 +1134,17 @@ export const pkiPage: Page = {
 
                     <form id="root-ca-form" class="form-stack" @submit=${onRootCA}>
                         ${subjectFields()}
-                        ${keyField(pki, 'ecc-p384')}
+                        <label>ISO 15118
+                            <select name="v2g" @change=${(event: Event) => { rootV2G = (event.currentTarget as HTMLSelectElement).value as V2GDomain | ''; draw(); }}>
+                                <option value="" ?selected=${rootV2G === ''}>none - a root of X.509 of its own</option>
+                                ${v2gRoots.map(([ domain, words ]) => html`<option value="${domain}" ?selected=${rootV2G === domain}>${words}</option>`)}
+                            </select>
+                            <span class="hint">
+                                A root of Plug & Charge, ISO 15118-2: below it, certificates of ISO 15118 only - with the
+                                key, the extensions and the 800 bytes at most it has.
+                            </span>
+                        </label>
+                        ${rootV2G !== '' ? v2gKeyNote() : keyField(pki, 'ecc-p384')}
                         ${validityField(pki, 3650, 'Ten years is usual for a root; nothing below it may outlive it.')}
                         ${pathLengthField('', 'How many sub-CAs may stand below it, one below the other. Empty for any number.')}
                         ${newPasswordFields('Without one, whoever can read the directory of this PKI can sign as this root.')}
@@ -1083,16 +1167,19 @@ export const pkiPage: Page = {
 
             // Read before the form is held still: a disabled field is no
             // field of the form any more.
-            const request = {
+            const v2g      = (field(form, 'v2g') || null) as V2GDomain | null;
+
+            const request  = {
                 subject:       subjectOf(form),
-                keyAlgorithm:  field(form, 'keyAlgorithm'),
+                keyAlgorithm:  v2g ? 'ecc-p256' : field(form, 'keyAlgorithm'),
                 validDays:     numberField(form, 'validDays'),
                 pathLength:    field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength'),
-                keyPassword
+                keyPassword,
+                v2g
             };
 
             void make(form, 'root-ca', () => api.pki.rootCA(request),
-                      created => `Made the root CA '${created.commonName}'.`);
+                      created => { rootV2G = ''; return `Made the ${kindOf(created)} '${created.commonName}'.`; });
 
         }
 
@@ -1102,6 +1189,9 @@ export const pkiPage: Page = {
         // ------------------------------------------------------------------
 
         function subCAView(pki: PKICertificates): TemplateResult {
+
+            const domains = chosenIssuer(pki, 'sub-ca', true)?.v2g ? subCADomainsBelow(chosenIssuer(pki, 'sub-ca', true)!) : [];
+
             return html`
                 <section class="card">
 
@@ -1115,10 +1205,20 @@ export const pkiPage: Page = {
                     ${noSigner(pki, true) ?? html`
                         <form id="sub-ca-form" class="form-stack" @submit=${onSubCA}>
                             ${issuerField(pki, true, 'sub-ca')}
+                            ${domains.length > 0 ? html`
+                                <label>Domain (ISO 15118)
+                                    <select name="v2g">
+                                        ${domains.map(domain => html`<option value="${domain}">${domain} sub-CA</option>`)}
+                                    </select>
+                                    <span class="hint">
+                                        Below a CA of ISO 15118, a sub-CA of ISO 15118: of path length 1 below a root and 0 below a
+                                        sub-CA - two at most, as ISO 15118-2 has it.
+                                    </span>
+                                </label>` : nothing}
                             ${subjectFields()}
-                            ${keyField(pki, 'ecc-p384')}
-                            ${validityField(pki, 1825, 'No longer than the CA that signs it.')}
-                            ${pathLengthField('0', '0 lets it sign certificates for servers and clients and no CA; empty, as many as its CA allows.')}
+                            ${domains.length > 0 ? v2gKeyNote() : keyField(pki, 'ecc-p384')}
+                            ${validityField(pki, domains.length > 0 ? 1460 : 1825, 'No longer than the CA that signs it.')}
+                            ${domains.length > 0 ? nothing : pathLengthField('0', '0 lets it sign certificates for servers and clients and no CA; empty, as many as its CA allows.')}
                             ${newPasswordFields('Without one, whoever can read the directory of this PKI can sign as this sub-CA.')}
                             ${formActions('sub-ca', 'Make the sub-CA')}
                         </form>
@@ -1138,18 +1238,21 @@ export const pkiPage: Page = {
             if (keyPassword === undefined)
                 return;
 
-            const request = {
+            const v2g      = (field(form, 'v2g') || null) as V2GDomain | null;
+
+            const request  = {
                 issuer:             field(form, 'issuer'),
                 issuerKeyPassword:  issuerPasswordOf(form),
                 subject:            subjectOf(form),
-                keyAlgorithm:       field(form, 'keyAlgorithm'),
+                keyAlgorithm:       v2g ? 'ecc-p256' : field(form, 'keyAlgorithm'),
                 validDays:          numberField(form, 'validDays'),
-                pathLength:         field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength'),
-                keyPassword
+                pathLength:         v2g || field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength'),
+                keyPassword,
+                v2g
             };
 
             void make(form, 'sub-ca', () => api.pki.subCA(request),
-                      created => `Made the sub-CA '${created.commonName}' below '${commonNameOf(created.issuerId)}'.`);
+                      created => `Made the ${kindOf(created)} '${created.commonName}' below '${commonNameOf(created.issuerId)}'.`);
 
         }
 
@@ -1159,6 +1262,10 @@ export const pkiPage: Page = {
         // ------------------------------------------------------------------
 
         function issueView(pki: PKICertificates): TemplateResult {
+
+            const issuerDomain  = chosenIssuer(pki, 'issue', false)?.v2g ?? null;
+            const domain        = issuerDomain ? leafDomainBelow(issuerDomain) : null;
+
             return html`
                 <section class="card">
 
@@ -1173,21 +1280,32 @@ export const pkiPage: Page = {
                     ${noSigner(pki, false) ?? html`
                         <form id="issue-form" class="form-stack" @submit=${onIssue}>
                             ${issuerField(pki, false, 'issue')}
-                            <label>For
-                                <select name="profile">
-                                    <option value="server">a server (TLS server authentication)</option>
-                                    <option value="client">a client (TLS client authentication)</option>
-                                </select>
-                            </label>
+                            ${domain ? html`
+                                <label>For
+                                    <select name="v2g">
+                                        <option value="${domain}">${leafWords(domain)} (ISO 15118-2)</option>
+                                    </select>
+                                    <span class="hint">
+                                        What a CA of ISO 15118 signs: its domain, ${domain}, first in the subject, and no other
+                                        names - its common name is who it is${domain === 'CPO' ? ', the EVSE ID of the charging station' : domain === 'MO' ? ', the EMAID of the contract' : ''}.
+                                    </span>
+                                </label>` : html`
+                                <label>For
+                                    <select name="profile">
+                                        <option value="server">a server (TLS server authentication)</option>
+                                        <option value="client">a client (TLS client authentication)</option>
+                                    </select>
+                                </label>`}
                             ${subjectFields()}
-                            <label>Other names
-                                <textarea name="names" rows="3" spellcheck="false" autocomplete="off" placeholder="csms.example.org&#10;192.168.1.10"></textarea>
-                                <span class="hint">
-                                    Host names, IP addresses, mail addresses or URIs, one per line. A server certificate
-                                    without any gets its common name, where that reads as a host name.
-                                </span>
-                            </label>
-                            ${keyField(pki, 'ecc-p256')}
+                            ${domain ? nothing : html`
+                                <label>Other names
+                                    <textarea name="names" rows="3" spellcheck="false" autocomplete="off" placeholder="csms.example.org&#10;192.168.1.10"></textarea>
+                                    <span class="hint">
+                                        Host names, IP addresses, mail addresses or URIs, one per line. A server certificate
+                                        without any gets its common name, where that reads as a host name.
+                                    </span>
+                                </label>`}
+                            ${domain ? v2gKeyNote() : keyField(pki, 'ecc-p256')}
                             ${validityField(pki, 365, 'No longer than the CA that signs it.')}
                             ${newPasswordFields('With one, the key is downloaded encrypted, and whatever opens it asks for it.')}
                             ${formActions('issue', 'Make the certificate')}
@@ -1208,19 +1326,22 @@ export const pkiPage: Page = {
             if (keyPassword === undefined)
                 return;
 
-            const request = {
+            const v2g      = (field(form, 'v2g') || null) as V2GDomain | null;
+
+            const request  = {
                 issuer:                   field(form, 'issuer'),
                 issuerKeyPassword:        issuerPasswordOf(form),
                 keyPassword,
-                profile:                  field(form, 'profile') as 'server' | 'client',
+                profile:                  (v2g ? (v2g === 'CPO' ? 'server' : 'client') : field(form, 'profile')) as 'server' | 'client',
                 subject:                  subjectOf(form),
-                keyAlgorithm:             field(form, 'keyAlgorithm'),
+                keyAlgorithm:             v2g ? 'ecc-p256' : field(form, 'keyAlgorithm'),
                 validDays:                numberField(form, 'validDays'),
-                subjectAlternativeNames:  namesIn(field(form, 'names', false))
+                subjectAlternativeNames:  v2g ? [] : namesIn(field(form, 'names', false)),
+                v2g
             };
 
             void make(form, 'issue', () => api.pki.issue(request),
-                      created => `Made the ${profileWords[created.profile]} certificate '${created.commonName}' below '${commonNameOf(created.issuerId)}'.`);
+                      created => `Made the ${kindOf(created)} certificate '${created.commonName}' below '${commonNameOf(created.issuerId)}'.`);
 
         }
 
@@ -1230,6 +1351,11 @@ export const pkiPage: Page = {
         // ------------------------------------------------------------------
 
         function csrView(pki: PKICertificates): TemplateResult {
+
+            const issuer   = chosenIssuer(pki, 'csr', false);
+            const domain   = issuer?.v2g ? leafDomainBelow(issuer.v2g) : null;
+            const subCAs   = issuer?.v2g && issuer.pathLength !== 0 ? subCADomainsBelow(issuer) : [];
+
             return html`
                 <section class="card">
 
@@ -1247,12 +1373,18 @@ export const pkiPage: Page = {
                             ${issuerField(pki, false, 'csr')}
 
                             <label>Sign it as
-                                <select name="profile">
-                                    ${maySign ? html`
-                                        <option value="client">a client certificate</option>
-                                        <option value="server">a server certificate</option>` : nothing}
-                                    ${mayMakeCAs ? html`<option value="subCA">a sub-CA, whose key is somewhere else</option>` : nothing}
-                                </select>
+                                ${domain ? html`
+                                    <select name="as">
+                                        ${maySign ? html`<option value="${domain === 'CPO' ? 'server' : 'client'}:${domain}">${leafWords(domain)} (ISO 15118-2)</option>` : nothing}
+                                        ${mayMakeCAs ? subCAs.map(one => html`<option value="subCA:${one}">a ${one} sub-CA of ISO 15118, whose key is somewhere else</option>`) : nothing}
+                                    </select>
+                                    <span class="hint">Its domain is put first in its subject where the CSR names none; a CSR of another domain is not signed.</span>` : html`
+                                    <select name="profile">
+                                        ${maySign ? html`
+                                            <option value="client">a client certificate</option>
+                                            <option value="server">a server certificate</option>` : nothing}
+                                        ${mayMakeCAs ? html`<option value="subCA">a sub-CA, whose key is somewhere else</option>` : nothing}
+                                    </select>`}
                             </label>
 
                             <label>CSR
@@ -1272,18 +1404,19 @@ export const pkiPage: Page = {
 
                             ${csrPreviewView()}
 
-                            <label class="checkbox">
-                                <input type="checkbox" name="takeNames" checked />
-                                Take over the other names the CSR asks for
-                            </label>
+                            ${domain ? nothing : html`
+                                <label class="checkbox">
+                                    <input type="checkbox" name="takeNames" checked />
+                                    Take over the other names the CSR asks for
+                                </label>
 
-                            <label>Other names besides
-                                <textarea name="names" rows="2" spellcheck="false" autocomplete="off"></textarea>
-                                <span class="hint">Host names, IP addresses, mail addresses or URIs, one per line.</span>
-                            </label>
+                                <label>Other names besides
+                                    <textarea name="names" rows="2" spellcheck="false" autocomplete="off"></textarea>
+                                    <span class="hint">Host names, IP addresses, mail addresses or URIs, one per line.</span>
+                                </label>`}
 
                             ${validityField(pki, 365, 'No longer than the CA that signs it.')}
-                            ${mayMakeCAs ? pathLengthField('0', 'For a sub-CA only: how many CAs may stand below it.') : nothing}
+                            ${mayMakeCAs && !domain ? pathLengthField('0', 'For a sub-CA only: how many CAs may stand below it.') : nothing}
 
                             ${formActions('csr', 'Sign it')}
 
@@ -1366,19 +1499,24 @@ export const pkiPage: Page = {
 
             const form = event.currentTarget as HTMLFormElement;
 
+            // Of ISO 15118: "profile:domain", one choice for both.
+            const [ v2gProfile, v2gDomain ] = field(form, 'as').split(':');
+            const v2g                       = (v2gDomain || null) as V2GDomain | null;
+
             const request = {
                 issuer:                       field(form, 'issuer'),
                 issuerKeyPassword:            issuerPasswordOf(form),
-                profile:                      field(form, 'profile') as 'subCA' | 'server' | 'client',
+                profile:                      (v2g ? v2gProfile : field(form, 'profile')) as 'subCA' | 'server' | 'client',
                 csr:                          field(form, 'csr'),
                 validDays:                    numberField(form, 'validDays'),
-                subjectAlternativeNames:      namesIn(field(form, 'names', false)),
-                takeSubjectAlternativeNames:  isChecked(form, 'takeNames'),
-                pathLength:                   field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength')
+                subjectAlternativeNames:      v2g ? [] : namesIn(field(form, 'names', false)),
+                takeSubjectAlternativeNames:  v2g ? false : isChecked(form, 'takeNames'),
+                pathLength:                   v2g || field(form, 'pathLength') === '' ? null : numberField(form, 'pathLength'),
+                v2g
             };
 
             void make(form, 'csr', () => api.pki.signCSR(request),
-                      created => `Signed the CSR of '${created.commonName}' as a ${profileWords[created.profile]} below '${commonNameOf(created.issuerId)}'.`);
+                      created => `Signed the CSR of '${created.commonName}' as a ${kindOf(created)} below '${commonNameOf(created.issuerId)}'.`);
 
         }
 
@@ -1454,7 +1592,8 @@ export const pkiPage: Page = {
                                                 @click=${() => { if (entry.inPKI) { show('certificates'); void open(entry.id); } }}>
                                                 <td>${entry.index}</td>
                                                 <td>${moment(entry.loggedAt)}</td>
-                                                <td><span class="chip">${entry.ocspResponder ? 'OCSP responder' : profileWords[entry.profile]}</span></td>
+                                                <td><span class="chip ${entry.v2g ? 'on' : ''}">${entry.ocspResponder ? 'OCSP responder' : kindOf(entry)}</span>
+                                                    ${entry.precertificate ? html`<span class="muted precert" title="The log signed its precertificate, and the certificate carries the timestamp">precertificate</span>` : nothing}</td>
                                                 <td class="common-name">${entry.commonName}</td>
                                                 <td>${entry.ocspResponder
                                                           ? html`<span class="muted">beside its CA</span>`
@@ -1659,7 +1798,7 @@ export const pkiPage: Page = {
         /** The CAs EST may sign with: every CA of the PKI. */
         function estIssuerOptions(pki: PKICertificates, Chosen: string | undefined): TemplateResult {
             return html`${pki.certificates.filter(certificate => certificate.profile === 'rootCA' || certificate.profile === 'subCA').map(ca => html`
-                <option value="${ca.id}" ?selected=${ca.id === Chosen}>${ca.commonName} - ${profileWords[ca.profile]}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
+                <option value="${ca.id}" ?selected=${ca.id === Chosen}>${ca.commonName} - ${kindOf(ca)}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
             `)}`;
         }
 
@@ -1764,6 +1903,15 @@ export const pkiPage: Page = {
                                   : 'Only where the PKI speaks HTTPS of its own: behind a proxy that ends TLS, the station renews with an API key.'}
                         </span>
 
+                        <label class="checkbox">
+                            <input type="checkbox" name="serverKeyGeneration" ?checked=${overview.serverKeyGeneration} ?disabled=${!mayMakeCAs} />
+                            Make the key at <code>serverkeygen</code>, for a station that cannot make one of its own
+                        </label>
+                        <span class="hint">
+                            The key goes back with the certificate, unencrypted, over HTTPS only - the PKI's own, or that of a trusted
+                            proxy in front - and stays in this PKI, as every key it makes does.
+                        </span>
+
                         ${mayMakeCAs ? formActions('est', 'Save') : nothing}
 
                     </form>
@@ -1796,7 +1944,8 @@ export const pkiPage: Page = {
             const settings = {
                 ...(issuer.length > 0 ? { issuer, profile: field(form, 'profile') as 'server' | 'client', validDays: numberField(form, 'validDays') } : {}),
                 labels,
-                tlsClientCertificates: isChecked(form, 'tlsClientCertificates')
+                tlsClientCertificates:  isChecked(form, 'tlsClientCertificates'),
+                serverKeyGeneration:    isChecked(form, 'serverKeyGeneration')
             };
 
             try

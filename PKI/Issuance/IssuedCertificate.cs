@@ -59,8 +59,22 @@ namespace cloud.charging.open.PKI.Issuance
                                            DateTimeOffset          CreatedAt,
                                            String?                 CreatedBy,
                                            DateTimeOffset?         RevokedAt         = null,
-                                           String?                 RevocationReason  = null)
+                                           String?                 RevocationReason  = null,
+                                           V2GDomain?              V2G               = null)
     {
+
+        #region InWords
+
+        /// <summary>
+        /// What it is, as a sentence says it: "root CA", "server certificate" -
+        /// or for a certificate of ISO 15118, "V2G root CA", "SECC certificate".
+        /// </summary>
+        public String InWords
+            => V2G is V2GDomain domain
+                   ? ISO15118.InWords(Profile, domain)
+                   : Profile.InWords();
+
+        #endregion
 
         #region StatusAt(Now)
 
@@ -108,7 +122,8 @@ namespace cloud.charging.open.PKI.Issuance
                            new JProperty("createdAt",                CreatedAt.ToString("o", CultureInfo.InvariantCulture)),
                            new JProperty("createdBy",                CreatedBy),
                            new JProperty("revokedAt",                RevokedAt?.ToString("o", CultureInfo.InvariantCulture)),
-                           new JProperty("revocationReason",         RevocationReason)
+                           new JProperty("revocationReason",         RevocationReason),
+                           new JProperty("v2g",                      V2G?.AsText())
                        );
 
             if (Now is not null)
@@ -158,7 +173,8 @@ namespace cloud.charging.open.PKI.Issuance
                            KeyEncrypted:             json.Value<Boolean?>("keyEncrypted")  ?? false,
                            FromCSR:                  json.Value<Boolean?>("fromCSR")       ?? false,
                            CreatedAt:                DateTimeOffset.Parse(json.Value<String>("createdAt")!, CultureInfo.InvariantCulture),
-                           CreatedBy:                json.Value<String>("createdBy")
+                           CreatedBy:                json.Value<String>("createdBy"),
+                           V2G:                      ISO15118.TryParse(json.Value<String>("v2g"), out var v2g) ? v2g : null
                        );
 
             }

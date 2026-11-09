@@ -533,6 +533,175 @@ namespace cloud.charging.open.PKI.Tests
 
         #endregion
 
+        #region Precertificates, and the timestamps certificates carry
+
+        /// <summary>
+        /// A server's certificate carries the signed certificate timestamp of
+        /// its precertificate: signed as RFC 6962 has it - version, signature
+        /// type, timestamp, entry type precert_entry, the hash of the CA's key,
+        /// the TBSCertificate without the poison, no extensions - over exactly
+        /// what the certificate is without its timestamps, and in the log as a
+        /// precert_entry, found by the certificate.
+        /// </summary>
+        [Test]
+        public void AServersCertificateCarriesTheTimestampOfItsPrecertificate()
+        {
+
+            var store = new PKIStore(directory);
+
+            Assert.That(store.TryCreateRootCA(new SubjectName("Root"), KeyAlgorithm.ECC_P256, 365, null, null, null, out var root, out var error, out _), Is.True, error);
+            Assert.That(store.TryIssue(root!.Id, null, CertificateProfile.SubCA, new SubjectName("Sub"), KeyAlgorithm.ECC_P256, 200, [], null, null, null,
+                                       out var sub, out error, out _), Is.True, error);
+            Assert.That(store.TryIssue(sub!.Id, null, CertificateProfile.Server, new SubjectName("csms.example.org"), KeyAlgorithm.RSA_2048, 30, [], null, null, null,
+                                       out var server, out error, out _), Is.True, error);
+
+            var log                 = store.Transparency;
+            using var certificate   = store.Load(server!.Id)!;
+            using var subCA         = store.Load(sub.Id)!;
+            using var rootCA        = store.Load(root.Id)!;
+            using var publicKey     = PublicKeyOf(log);
+
+            var sct                 = Precertificate.SCTsOf(certificate).Single();
+            var entry               = log.Find(server.Id)!;
+            using var precert       = X509CertificateLoader.LoadCertificate(entry.PreCertificate!);
+
+            var tbs                 = Precertificate.TBSWithout(certificate.RawData, Precertificate.SCTListOID);
+            var issuerKeyHash       = SHA256.HashData(subCA.PublicKey.ExportSubjectPublicKeyInfo());
+
+            // Written out here, byte for byte.
+            Byte[] signed = [ 0, 0, .. UInt64(sct.Timestamp), 0, 1, .. issuerKeyHash, .. Opaque24(tbs), 0, 0 ];
+            Byte[] leaf   = [ 0, 0, .. UInt64(sct.Timestamp), 0, 1, .. issuerKeyHash, .. Opaque24(tbs), 0, 0 ];
+
+            Assert.Multiple(() => {
+
+                Assert.That(sct.LogId,                                                 Is.EqualTo(log.LogId));
+                Assert.That(sct.Extensions,                                            Is.Empty);
+                Assert.That(publicKey.VerifyData(signed, SignatureIn(sct.Signature), HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence), Is.True,
+                            "the log signed what the certificate is without its timestamps");
+                Assert.That(log.Verify(sct, certificate, subCA),                       Is.True);
+                Assert.That(log.Verify(sct, certificate, rootCA),                      Is.False, "for its own CA only");
+
+                Assert.That(certificate.Extensions[Precertificate.SCTListOID]!.Critical, Is.False);
+                Assert.That(Precertificate.IsPoisoned(certificate),                    Is.False, "the certificate itself carries no poison");
+                Assert.That(Precertificate.IsPoisoned(precert),                        Is.True);
+                Assert.That(precert.SerialNumber,                                      Is.EqualTo(certificate.SerialNumber));
+                Assert.That(Precertificate.TBSWithout(precert.RawData, Precertificate.PoisonOID), Is.EqualTo(tbs),
+                            "the precertificate without its poison is the certificate without its timestamps");
+                Assert.That(Precertificate.TBSWithout(certificate.RawData, "1.2.3.4"), Is.EqualTo(TBSOf(certificate)),
+                            "without an extension it does not have, a certificate is what it was");
+
+                Assert.That(entry.IsPrecertificate,                                    Is.True);
+                Assert.That(entry.Timestamp,                                           Is.EqualTo(sct.Timestamp));
+                Assert.That(entry.MerkleTreeLeaf,                                      Is.EqualTo(leaf));
+                Assert.That(entry.ExtraData,                                           Is.EqualTo([ .. Opaque24(precert.RawData), .. Opaque24([ .. Opaque24(subCA.RawData), .. Opaque24(rootCA.RawData) ]) ]),
+                            "a PrecertChainEntry: the precertificate, and the chain above it");
+                Assert.That(entry.Certificate,                                         Is.EqualTo(certificate.RawData), "found by the certificate it became");
+                Assert.That(log.Verify(entry),                                         Is.True);
+
+                // CAs carry none: nothing checks the timestamps of a CA.
+                Assert.That(Precertificate.SCTsOf(rootCA),                             Is.Empty);
+                Assert.That(Precertificate.SCTsOf(subCA),                              Is.Empty);
+                Assert.That(log.Find(sub.Id)!.IsPrecertificate,                        Is.False);
+
+            });
+
+            #region After a restart: the same, and nothing taken in again
+
+            var again = new PKIStore(directory);
+
+            Assert.Multiple(() => {
+                Assert.That(again.Transparency.IsBroken,                               Is.False, String.Join(" ", again.Transparency.Problems));
+                Assert.That(again.TakenIntoTheLog,                                     Is.EqualTo(0));
+                Assert.That(again.Transparency.Count,                                  Is.EqualTo(log.Count));
+                Assert.That(again.Transparency.Find(server.Id)!.LeafHash,              Is.EqualTo(entry.LeafHash));
+            });
+
+            #endregion
+
+        }
+
+        [Test]
+        public void AClientsCertificateFromACSRCarriesItsTimestampToo()
+        {
+
+            var store = new PKIStore(directory);
+
+            Assert.That(store.TryCreateRootCA(new SubjectName("Root"), KeyAlgorithm.ECC_P384, 365, null, null, null, out var root, out var error, out _), Is.True, error);
+
+            using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var csr       = new CertificateRequest("CN=CS-0001", key, HashAlgorithmName.SHA256).CreateSigningRequestPem();
+
+            Assert.That(store.TryIssueFromCSR(root!.Id, null, CertificateProfile.Client, csr, 30, [], true, null, null, out var client, out error, out _), Is.True, error);
+
+            using var certificate = store.Load(client!.Id)!;
+            using var rootCA      = store.Load(root.Id)!;
+
+            Assert.That(store.Transparency.Verify(Precertificate.SCTsOf(certificate).Single(), certificate, rootCA), Is.True);
+
+        }
+
+        [Test]
+        public void APrecertificateChangedBreaksTheLog()
+        {
+
+            var store = new PKIStore(directory);
+
+            Assert.That(store.TryCreateRootCA(new SubjectName("Root"), KeyAlgorithm.ECC_P256, 365, null, null, null, out var root, out var error, out _), Is.True, error);
+            Assert.That(store.TryIssue(root!.Id, null, CertificateProfile.Client, new SubjectName("CS-0001"), KeyAlgorithm.ECC_P256, 30, [], null, null, null,
+                                       out var client, out error, out _), Is.True, error);
+
+            // The precertificate of another subject in its place.
+            Assert.That(store.TryIssue(root.Id, null, CertificateProfile.Client, new SubjectName("CS-9999"), KeyAlgorithm.ECC_P256, 30, [], null, null, null,
+                                       out var other, out error, out _), Is.True, error);
+
+            var file       = Path.Combine(directory, PKIStore.TransparencyDirectory, TransparencyLog.EntriesFileName);
+            var lines      = File.ReadAllLines(file);
+            var index      = (Int32) store.Transparency.Find(client!.Id)!.Index;
+            var otherLine  = Newtonsoft.Json.Linq.JObject.Parse(lines[store.Transparency.Find(other!.Id)!.Index]);
+            var line       = Newtonsoft.Json.Linq.JObject.Parse(lines[index]);
+            line["precertificate"] = otherLine["precertificate"];
+            lines[index]   = line.ToString(Newtonsoft.Json.Formatting.None);
+            File.WriteAllLines(file, lines);
+
+            var broken = new TransparencyLog(Path.Combine(directory, PKIStore.TransparencyDirectory));
+
+            Assert.That(broken.IsBroken, Is.True);
+            Assert.That(broken.Problems, Has.Some.Contains("does not hold"));
+
+        }
+
+        /// <summary>
+        /// The TBSCertificate of a certificate as it was written: its first
+        /// element, read here without anything of the PKI's.
+        /// </summary>
+        private static Byte[] TBSOf(X509Certificate2 Certificate)
+        {
+
+            // SEQUENCE, then its length in one byte or in 0x80 + n more; then
+            // the TBSCertificate, a SEQUENCE written the same way.
+            var der     = Certificate.RawData;
+            var offset  = 1 + LengthBytes(der, 1);
+            var length  = 1 + LengthBytes(der, offset + 1) + ContentLength(der, offset + 1);
+
+            return der[offset..(offset + length)];
+
+            static Int32 LengthBytes(Byte[] Der, Int32 At)
+                => Der[At] < 0x80 ? 1 : 1 + (Der[At] & 0x7F);
+
+            static Int32 ContentLength(Byte[] Der, Int32 At)
+            {
+                if (Der[At] < 0x80)
+                    return Der[At];
+                var length = 0;
+                for (var i = 1; i <= (Der[At] & 0x7F); i++)
+                    length = (length << 8) | Der[At + i];
+                return length;
+            }
+
+        }
+
+        #endregion
+
     }
 
 }

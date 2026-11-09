@@ -492,6 +492,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// <param name="PathLength">How many sub-CAs may stand below it, one below the other; null for any number.</param>
         /// <param name="KeyPassword">The password its key is encrypted with; null to keep it unencrypted.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
+        /// <param name="V2G">The domain of a root CA of ISO 15118 - V2G, MO or OEM; null for none of ISO 15118.</param>
         public Boolean TryCreateRootCA(SubjectName                                   Subject,
                                        KeyAlgorithm                                  KeyAlgorithm,
                                        Int32                                         ValidDays,
@@ -500,7 +501,8 @@ namespace cloud.charging.open.PKI.Issuance
                                        String?                                       CreatedBy,
                                        [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                        [NotNullWhen(false)] out String?              Error,
-                                       out Boolean                                   NotSaved)
+                                       out Boolean                                   NotSaved,
+                                       V2GDomain?                                    V2G = null)
         {
 
             Certificate  = null;
@@ -508,17 +510,18 @@ namespace cloud.charging.open.PKI.Issuance
 
             if (!ValidityIsFine(ValidDays, out Error) ||
                 !PathLengthIsFine(PathLength, out Error) ||
-                !KeyPasswordIsFine(KeyPassword, out Error))
+                !KeyPasswordIsFine(KeyPassword, out Error) ||
+                !ISO15118IsFine(CertificateProfile.RootCA, V2G, KeyAlgorithm, out Error) ||
+                !TrySubjectOf(Subject.ToX500(), V2G, out var subject, out Error))
             {
                 return false;
             }
 
             using var key   = KeyAlgorithm.NewKey();
             var now         = timeProvider.GetUtcNow();
-            var subject     = Subject.ToX500();
 
             var request     = NewRequest(subject, new PublicKey(key), KeyAlgorithm.Hash);
-            AddExtensions(request, CertificateProfile.RootCA, request.PublicKey, PathLength, [], issuer: null, IssuerId: null);
+            AddExtensions(request, CertificateProfile.RootCA, request.PublicKey, PathLength, [], issuer: null, IssuerId: null, V2G);
 
             using var certificate = request.Create(
                                         subject,
@@ -528,8 +531,11 @@ namespace cloud.charging.open.PKI.Issuance
                                         NewSerialNumber()
                                     );
 
-            if (!TryKeep(certificate, key, KeyPassword, CertificateProfile.RootCA, null, PathLength, false, CreatedBy, out Certificate, out Error, out NotSaved))
+            if (!FitsISO15118(certificate, V2G, out Error) ||
+                !TryKeep(certificate, key, KeyPassword, CertificateProfile.RootCA, null, PathLength, false, CreatedBy, V2G, out Certificate, out Error, out NotSaved))
+            {
                 return false;
+            }
 
             // Its key is open now, and may not be again for a while: its CRL
             // and its OCSP responder, while it is.
@@ -557,6 +563,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// <param name="PathLength">For a sub-CA: how many sub-CAs may stand below it; null for as many as its CA allows.</param>
         /// <param name="KeyPassword">The password its new key is encrypted with; null to keep it unencrypted.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
+        /// <param name="V2G">The domain of a certificate of ISO 15118; null for none of ISO 15118.</param>
         public Boolean TryIssue(String                                        IssuerId,
                                 String?                                       IssuerKeyPassword,
                                 CertificateProfile                            Profile,
@@ -569,7 +576,8 @@ namespace cloud.charging.open.PKI.Issuance
                                 String?                                       CreatedBy,
                                 [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                 [NotNullWhen(false)] out String?              Error,
-                                out Boolean                                   NotSaved)
+                                out Boolean                                   NotSaved,
+                                V2GDomain?                                    V2G = null)
         {
 
             Certificate  = null;
@@ -581,13 +589,18 @@ namespace cloud.charging.open.PKI.Issuance
                 return false;
             }
 
-            if (!KeyPasswordIsFine(KeyPassword, out Error))
+            if (!KeyPasswordIsFine(KeyPassword, out Error) ||
+                !ISO15118IsFine(Profile, V2G, KeyAlgorithm, out Error) ||
+                !NoNamesInISO15118(V2G, AlternativeNames, out Error) ||
+                !TrySubjectOf(Subject.ToX500(), V2G, out var subject, out Error))
+            {
                 return false;
+            }
 
             using var key = KeyAlgorithm.NewKey();
 
-            return TrySign(IssuerId, IssuerKeyPassword, Profile, Subject.ToX500(), Subject.CommonName, new PublicKey(key), key, KeyPassword,
-                           ValidDays, WithHostName(Profile, Subject.CommonName, AlternativeNames), PathLength, false, CreatedBy,
+            return TrySign(IssuerId, IssuerKeyPassword, Profile, subject, Subject.CommonName, new PublicKey(key), key, KeyPassword,
+                           ValidDays, V2G is null ? WithHostName(Profile, Subject.CommonName, AlternativeNames) : [], PathLength, false, CreatedBy, V2G,
                            out Certificate, out Error, out NotSaved);
 
         }
@@ -618,6 +631,7 @@ namespace cloud.charging.open.PKI.Issuance
         /// <param name="TakeAlternativeNames">Whether the names the request asks for are taken over.</param>
         /// <param name="PathLength">For a sub-CA: how many sub-CAs may stand below it.</param>
         /// <param name="CreatedBy">Who asked for it.</param>
+        /// <param name="V2G">The domain of a certificate of ISO 15118 - whose subject is given its DomainComponent where it has none, and which takes no alternative names; null for none of ISO 15118.</param>
         public Boolean TryIssueFromCSR(String                                        IssuerId,
                                        String?                                       IssuerKeyPassword,
                                        CertificateProfile                            Profile,
@@ -629,7 +643,8 @@ namespace cloud.charging.open.PKI.Issuance
                                        String?                                       CreatedBy,
                                        [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                        [NotNullWhen(false)] out String?              Error,
-                                       out Boolean                                   NotSaved)
+                                       out Boolean                                   NotSaved,
+                                       V2GDomain?                                    V2G = null)
         {
 
             Certificate  = null;
@@ -644,42 +659,92 @@ namespace cloud.charging.open.PKI.Issuance
             if (!TryLoadCSR(CSR, out var request, out Error))
                 return false;
 
-            if (KeyAlgorithm.Of(request.PublicKey) is null)
+            if (KeyAlgorithm.Of(request.PublicKey) is not KeyAlgorithm keyAlgorithm)
             {
                 Error = $"The CSR is for a key of {KeyAlgorithm.Describe(request.PublicKey)}, which this PKI does not sign: " +
                         $"{String.Join(", ", KeyAlgorithm.All.Select(algorithm => algorithm.Name))}.";
                 return false;
             }
 
-            var commonName = CommonNameOf(request.SubjectName);
-
-            if (commonName is null)
+            if (!ISO15118IsFine(Profile, V2G, keyAlgorithm, out Error) ||
+                !NoNamesInISO15118(V2G, AlternativeNames, out Error) ||
+                !TrySubjectOf(request.SubjectName, V2G, out var subject, out Error) ||
+                !TryNamesOf(request, Profile, AlternativeNames, TakeAlternativeNames && V2G is null, V2G is null, out var commonName, out var names, out Error))
             {
-                Error = "The CSR names no common name, and a certificate of this PKI is found by its common name.";
                 return false;
             }
 
-            var names = new List<String>();
+            return TrySign(IssuerId, IssuerKeyPassword, Profile, subject, commonName, request.PublicKey, null, null,
+                           ValidDays, names, PathLength, true, CreatedBy, V2G,
+                           out Certificate, out Error, out NotSaved);
 
-            if (TakeAlternativeNames)
-                names.AddRange(AlternativeNames_Of(request));
+        }
 
-            foreach (var name in AlternativeNames)
-                if (!names.Contains(name, StringComparer.OrdinalIgnoreCase))
-                    names.Add(name);
+        #endregion
 
-            foreach (var name in names)
+        #region TryIssueWithKeyFor(...)
+
+        /// <summary>
+        /// A new certificate below a CA of this store for the subject and the
+        /// names of a certificate signing request - and a key made here, not
+        /// the key of the request: what EST's "serverkeygen" does for whoever
+        /// cannot make a key of its own.
+        /// </summary>
+        /// <remarks>
+        /// The key of the request, and its signature, are only what carries
+        /// the subject: RFC 7030, section 4.4.1, has them ignored. What kind
+        /// of key is made is the kind the request was signed with, where this
+        /// PKI makes those - ECC P-256 otherwise. The key made is kept as every
+        /// key made here is, unencrypted, and handed back.
+        /// </remarks>
+        /// <param name="IssuerId">The CA that signs it.</param>
+        /// <param name="IssuerKeyPassword">The password of the CA's key, where it has one.</param>
+        /// <param name="Profile">A server or a client.</param>
+        /// <param name="CSR">The request, as PEM - or as Base64 of its DER.</param>
+        /// <param name="ValidDays">For how many days from now it holds; no longer than its CA.</param>
+        /// <param name="CreatedBy">Who asked for it.</param>
+        /// <param name="PrivateKey">The key made, as PKCS#8 DER.</param>
+        public Boolean TryIssueWithKeyFor(String                                        IssuerId,
+                                          String?                                       IssuerKeyPassword,
+                                          CertificateProfile                            Profile,
+                                          String                                        CSR,
+                                          Int32                                         ValidDays,
+                                          String?                                       CreatedBy,
+                                          [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
+                                          [NotNullWhen(true)]  out Byte[]?              PrivateKey,
+                                          [NotNullWhen(false)] out String?              Error,
+                                          out Boolean                                   NotSaved)
+        {
+
+            Certificate  = null;
+            PrivateKey   = null;
+            NotSaved     = false;
+
+            if (Profile.IsCA())
             {
-                if (!Issuance.AlternativeNames.IsValid(name, out var why))
-                {
-                    Error = why;
-                    return false;
-                }
+                Error = "A key is made here for a server or a client, never for a CA.";
+                return false;
             }
 
-            return TrySign(IssuerId, IssuerKeyPassword, Profile, request.SubjectName, commonName, request.PublicKey, null, null,
-                           ValidDays, WithHostName(Profile, commonName, names), PathLength, true, CreatedBy,
-                           out Certificate, out Error, out NotSaved);
+            if (!TryLoadCSR(CSR, out var request, out Error, SkipSignature: true) ||
+                !TryNamesOf(request, Profile, [], true, true, out var commonName, out var names, out Error))
+            {
+                return false;
+            }
+
+            var keyAlgorithm = KeyAlgorithm.Of(request.PublicKey) ?? KeyAlgorithm.ECC_P256;
+
+            using var key = keyAlgorithm.NewKey();
+
+            if (!TrySign(IssuerId, IssuerKeyPassword, Profile, request.SubjectName, commonName, new PublicKey(key), key, null,
+                         ValidDays, names, null, false, CreatedBy, null,
+                         out Certificate, out Error, out NotSaved))
+            {
+                return false;
+            }
+
+            PrivateKey = key.ExportPkcs8PrivateKey();
+            return true;
 
         }
 
@@ -963,6 +1028,7 @@ namespace cloud.charging.open.PKI.Issuance
                                 Int32?                                        PathLength,
                                 Boolean                                       FromCSR,
                                 String?                                       CreatedBy,
+                                V2GDomain?                                    V2G,
                                 [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
                                 [NotNullWhen(false)] out String?              Error,
                                 out Boolean                                   NotSaved)
@@ -987,9 +1053,50 @@ namespace cloud.charging.open.PKI.Issuance
 
             if (!issuer.Profile.IsCA())
             {
-                Error = $"'{issuer.CommonName}' is a {issuer.Profile.InWords()}, which signs nothing.";
+                Error = $"'{issuer.CommonName}' is a {issuer.InWords}, which signs nothing.";
                 return false;
             }
+
+            #region ISO 15118: a chain of it, or none
+
+            if (V2G is V2GDomain domain)
+            {
+
+                if (issuer.V2G is not V2GDomain issuerDomain)
+                {
+                    Error = $"A {ISO15118.InWords(Profile, domain)} of ISO 15118 is signed by a CA of ISO 15118; the {issuer.InWords} '{issuer.CommonName}' is none.";
+                    return false;
+                }
+
+                if (!ISO15118.MaySignBelow(issuer, issuerDomain, Profile, domain, out Error))
+                    return false;
+
+                // ISO 15118-2 has at most two sub-CAs below a root: the first
+                // of path length 1, the second of 0.
+                if (Profile == CertificateProfile.SubCA)
+                {
+
+                    var expected = issuer.Profile == CertificateProfile.RootCA ? 1 : 0;
+
+                    if (PathLength is Int32 given && given != expected)
+                    {
+                        Error = $"A sub-CA of ISO 15118 below a {(expected == 1 ? "root" : "sub-CA")} has the path length {expected}, not {given}.";
+                        return false;
+                    }
+
+                    PathLength = expected;
+
+                }
+
+            }
+
+            else if (issuer.V2G is not null)
+            {
+                Error = $"The {issuer.InWords} '{issuer.CommonName}' is a CA of ISO 15118, and signs certificates of ISO 15118 only.";
+                return false;
+            }
+
+            #endregion
 
             var keyPEM = PrivateKeyPEM(issuer.Id);
 
@@ -1055,21 +1162,73 @@ namespace cloud.charging.open.PKI.Issuance
 
             using var issuerKey          = loadedKey;
 
-            var hash     = KeyAlgorithm.Of(issuerCertificate.PublicKey)?.Hash ?? HashAlgorithmName.SHA256;
-            var request  = NewRequest(Subject, PublicKey, hash);
+            var hash       = KeyAlgorithm.Of(issuerCertificate.PublicKey)?.Hash ?? HashAlgorithmName.SHA256;
+            var request    = NewRequest(Subject, PublicKey, hash);
+            var generator  = GeneratorFor(issuerKey);
+            var notBefore  = now - ClockSkew;
+            var serial     = NewSerialNumber();
 
-            AddExtensions(request, Profile, PublicKey, PathLength, AlternativeNames, issuerCertificate, issuer.Id);
+            AddExtensions(request, Profile, PublicKey, PathLength, AlternativeNames, issuerCertificate, issuer.Id, V2G);
 
-            using var certificate = request.Create(
-                                        issuerCertificate.SubjectName,
-                                        GeneratorFor(issuerKey),
-                                        now - ClockSkew,
-                                        notAfter,
-                                        NewSerialNumber()
-                                    );
+            X509Certificate2 signed;
 
-            if (!TryKeep(certificate, PrivateKey, KeyPassword, Profile, issuer.Id, PathLength, FromCSR, CreatedBy, out Certificate, out Error, out NotSaved))
+            if (EmbedsSCTs(Profile, V2G))
+            {
+
+                #region A precertificate in the log first, and the certificate with its timestamp
+
+                request.CertificateExtensions.Add(Precertificate.Poison());
+
+                using var precertificate = request.Create(issuerCertificate.SubjectName, generator, notBefore, notAfter, serial);
+
+                request.CertificateExtensions.RemoveAt(request.CertificateExtensions.Count - 1);
+
+                var chain = ChainCertificates(issuer.Id);
+
+                try
+                {
+
+                    // The same request, the same serial and the same validity,
+                    // with the timestamp where the poison was: the certificate
+                    // the log signed, but for that.
+                    if (!Transparency.TryAppendPrecertificate(precertificate,
+                                                              chain,
+                                                              sct => {
+                                                                  request.CertificateExtensions.Add(Precertificate.SCTList([ sct ]));
+                                                                  return request.Create(issuerCertificate.SubjectName, generator, notBefore, notAfter, serial);
+                                                              },
+                                                              out var withSCT,
+                                                              out _,
+                                                              out var logError))
+                    {
+                        NotSaved = true;
+                        Error    = $"Nothing was signed: {logError}";
+                        return false;
+                    }
+
+                    signed = withSCT;
+
+                }
+                finally
+                {
+                    foreach (var one in chain)
+                        one.Dispose();
+                }
+
+                #endregion
+
+            }
+
+            else
+                signed = request.Create(issuerCertificate.SubjectName, generator, notBefore, notAfter, serial);
+
+            using var certificate = signed;
+
+            if (!FitsISO15118(certificate, V2G, out Error) ||
+                !TryKeep(certificate, PrivateKey, KeyPassword, Profile, issuer.Id, PathLength, FromCSR, CreatedBy, V2G, out Certificate, out Error, out NotSaved))
+            {
                 return false;
+            }
 
             // The key of the CA is open, and that of a new sub-CA too: what is
             // due of their CRLs and responders, while they are - for a CA
@@ -1099,6 +1258,7 @@ namespace cloud.charging.open.PKI.Issuance
                                 Int32?                                        PathLength,
                                 Boolean                                       FromCSR,
                                 String?                                       CreatedBy,
+                                V2GDomain?                                    V2G,
                                 [NotNullWhen(true)]  out IssuedCertificate?   Issued,
                                 [NotNullWhen(false)] out String?              Error,
                                 out Boolean                                   NotSaved)
@@ -1127,7 +1287,8 @@ namespace cloud.charging.open.PKI.Issuance
                             KeyEncrypted:             PrivateKey is not null && KeyPassword is not null,
                             FromCSR:                  FromCSR,
                             CreatedAt:                timeProvider.GetUtcNow(),
-                            CreatedBy:                CreatedBy
+                            CreatedBy:                CreatedBy,
+                            V2G:                      V2G
                         );
 
             lock (gate)
@@ -1282,10 +1443,38 @@ namespace cloud.charging.open.PKI.Issuance
                                    Int32?                 PathLength,
                                    IReadOnlyList<String>  AlternativeNames,
                                    X509Certificate2?      issuer,
-                                   String?                IssuerId)
+                                   String?                IssuerId,
+                                   V2GDomain?             V2G)
         {
 
             var isRSA = PublicKey.GetRSAPublicKey() is not null;
+
+            #region ISO 15118: what its profiles name, and nothing else
+
+            if (V2G is V2GDomain domain)
+            {
+
+                Request.CertificateExtensions.Add(new X509BasicConstraintsExtension(Profile.IsCA(), Profile.IsCA() && PathLength is not null, PathLength ?? 0, critical: true));
+                Request.CertificateExtensions.Add(new X509KeyUsageExtension(ISO15118.KeyUsageOf(Profile, domain), critical: true));
+                Request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(PublicKey, critical: false));
+
+                if (issuer is not null)
+                    Request.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(issuer, includeKeyIdentifier: true, includeIssuerAndSerial: false));
+
+                // A root names none; below it, where revocation is asked for -
+                // the responder alone, not where its CA is found: every byte
+                // counts towards the 800 a certificate has.
+                if (issuer is not null && IssuerId is not null && Addresses is RevocationAddresses v2gAddresses)
+                {
+                    Request.CertificateExtensions.Add(CertificateRevocationListBuilder.BuildCrlDistributionPointExtension([ v2gAddresses.CRL(IssuerId) ], critical: false));
+                    Request.CertificateExtensions.Add(new X509AuthorityInformationAccessExtension([ v2gAddresses.OCSP ], null, critical: false));
+                }
+
+                return;
+
+            }
+
+            #endregion
 
             if (Profile.IsCA())
             {
@@ -1507,6 +1696,58 @@ namespace cloud.charging.open.PKI.Issuance
             => AlternativeNames.Of(Request.CertificateExtensions);
 
         /// <summary>
+        /// The common name of a CSR, and the names its certificate is valid
+        /// for: those it asks for, where they are taken, and those given -
+        /// each checked, and a server's common name among them where it has
+        /// none else.
+        /// </summary>
+        private static Boolean TryNamesOf(CertificateRequest                                Request,
+                                          CertificateProfile                                Profile,
+                                          IReadOnlyList<String>                             Given,
+                                          Boolean                                           TakeThem,
+                                          Boolean                                           AddHostName,
+                                          [NotNullWhen(true)]  out String?                  CommonName,
+                                          [NotNullWhen(true)]  out IReadOnlyList<String>?   Names,
+                                          [NotNullWhen(false)] out String?                  Error)
+        {
+
+            Names       = null;
+            Error       = null;
+            CommonName  = CommonNameOf(Request.SubjectName);
+
+            if (CommonName is null)
+            {
+                Error = "The CSR names no common name, and a certificate of this PKI is found by its common name.";
+                return false;
+            }
+
+            var names = new List<String>();
+
+            if (TakeThem)
+                names.AddRange(AlternativeNames_Of(Request));
+
+            foreach (var name in Given)
+                if (!names.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    names.Add(name);
+
+            foreach (var name in names)
+            {
+                if (!Issuance.AlternativeNames.IsValid(name, out var why))
+                {
+                    Error = why;
+                    return false;
+                }
+            }
+
+            Names = AddHostName
+                        ? WithHostName(Profile, CommonName, names)
+                        : names;
+
+            return true;
+
+        }
+
+        /// <summary>
         /// The common name of a distinguished name, or null where it has none.
         /// </summary>
         private static String? CommonNameOf(X500DistinguishedName Name)
@@ -1551,6 +1792,100 @@ namespace cloud.charging.open.PKI.Issuance
             return Error is null;
 
         }
+
+        /// <summary>
+        /// Whether ISO 15118-2 has a certificate of the given profile in the
+        /// given domain, and for the given key - where it is one of ISO 15118.
+        /// </summary>
+        private static Boolean ISO15118IsFine(CertificateProfile                Profile,
+                                              V2GDomain?                        V2G,
+                                              KeyAlgorithm                      KeyAlgorithm,
+                                              [NotNullWhen(false)] out String?  Error)
+        {
+
+            Error = null;
+
+            if (V2G is not V2GDomain domain)
+                return true;
+
+            if (!ISO15118.IsAllowed(Profile, domain, out Error))
+                return false;
+
+            if (KeyAlgorithm != ISO15118.KeyAlgorithm)
+            {
+                Error = $"A certificate of ISO 15118-2 is for a key of {ISO15118.KeyAlgorithm.Name} - secp256r1 - and none else; this one is for {KeyAlgorithm.Name}.";
+                return false;
+            }
+
+            return true;
+
+        }
+
+        /// <summary>
+        /// Whether a certificate of ISO 15118 is asked to carry alternative
+        /// names, which its profiles have none of.
+        /// </summary>
+        private static Boolean NoNamesInISO15118(V2GDomain?                        V2G,
+                                                 IReadOnlyList<String>             AlternativeNames,
+                                                 [NotNullWhen(false)] out String?  Error)
+        {
+
+            Error = V2G is not null && AlternativeNames.Count > 0
+                        ? "A certificate of ISO 15118 carries no alternative names: its common name is who it is."
+                        : null;
+
+            return Error is null;
+
+        }
+
+        /// <summary>
+        /// The subject a certificate is made with: as given, and for a
+        /// certificate of ISO 15118 with the DomainComponent of its domain
+        /// first.
+        /// </summary>
+        private static Boolean TrySubjectOf(X500DistinguishedName                            Name,
+                                            V2GDomain?                                       V2G,
+                                            [NotNullWhen(true)]  out X500DistinguishedName?  Subject,
+                                            [NotNullWhen(false)] out String?                 Error)
+        {
+
+            if (V2G is V2GDomain domain)
+                return ISO15118.TryWithDomainComponent(Name, domain, out Subject, out Error);
+
+            Subject  = Name;
+            Error    = null;
+            return true;
+
+        }
+
+        /// <summary>
+        /// Whether a certificate of ISO 15118 fits where ISO 15118-2 carries
+        /// it: 800 bytes at most.
+        /// </summary>
+        private static Boolean FitsISO15118(X509Certificate2                  Certificate,
+                                            V2GDomain?                        V2G,
+                                            [NotNullWhen(false)] out String?  Error)
+        {
+
+            Error = V2G is not null && Certificate.RawData.Length > ISO15118.MaxCertificateSize
+                        ? $"The certificate would be {Certificate.RawData.Length} bytes, and ISO 15118-2 carries {ISO15118.MaxCertificateSize} at most: " +
+                           "a shorter subject - or a shorter address of the PKI, which the CRL and the OCSP responder are named by - makes it smaller."
+                        : null;
+
+            return Error is null;
+
+        }
+
+        /// <summary>
+        /// Whether a certificate carries the signed certificate timestamp of
+        /// the log in itself - those of servers and clients, whose TLS peers
+        /// check one; not a CA's, and not one of ISO 15118, whose profiles
+        /// have no room for it.
+        /// </summary>
+        private static Boolean EmbedsSCTs(CertificateProfile  Profile,
+                                          V2GDomain?          V2G)
+
+            => !Profile.IsCA() && V2G is null;
 
         private static Boolean PathLengthIsFine(Int32? PathLength, [NotNullWhen(false)] out String? Error)
         {

@@ -473,6 +473,7 @@ namespace cloud.charging.open.PKI.Tests
                 Assert.That(status, Is.EqualTo(HttpStatusCode.Created), made.ToString());
                 // After the root and its OCSP responder.
                 Assert.That(made["transparency"]!["index"]!.Value<Int64>(), Is.EqualTo(i + 1));
+                Assert.That(made["transparency"]!["embedded"]!.Value<Boolean>(), Is.True, "a client's certificate carries its timestamp");
             }
 
             #region The log, and its newest tree head checked with its key
@@ -504,6 +505,12 @@ namespace cloud.charging.open.PKI.Tests
             (status, var entries) = await Get(operator_, $"{ct}/get-entries?start=0&end=99");
 
             Assert.That(entries["entries"]!.Count(), Is.EqualTo(5), "as many as there are");
+
+            // The root and its responder as x509_entry, the clients as
+            // precert_entry: the entry type after version, leaf type and
+            // timestamp - and the precertificate first in their extra_data.
+            Assert.That(entries["entries"]!.Select(entry => Convert.FromBase64String(entry["leaf_input"]!.Value<String>()!)[11]),
+                        Is.EqualTo(new Byte[] { 0, 0, 1, 1, 1 }));
 
             foreach (var (entry, index) in entries["entries"]!.Select((entry, index) => (entry, index)))
             {
@@ -545,6 +552,7 @@ namespace cloud.charging.open.PKI.Tests
             var lastId           = listed["entries"]![4]!["id"]!.Value<String>();
 
             Assert.That(listed["entries"]![1]!["ocspResponder"]!.Value<Boolean>(), Is.True, "the OCSP responder of the root");
+            Assert.That(listed["entries"]![4]!["precertificate"]!.Value<Boolean>(), Is.True);
 
             (status, _) = await Delete(admin, $"api/v1/pki/certificates/{lastId}");
             Assert.That(status, Is.EqualTo(HttpStatusCode.OK));
@@ -567,6 +575,52 @@ namespace cloud.charging.open.PKI.Tests
             #endregion
 
         }
+
+        #region AV2GPKIIsMadeOverTheAPI()
+
+        /// <summary>
+        /// A PKI of ISO 15118 over the JSON API: a V2G root, two sub-CAs and a
+        /// SECC certificate, whose profile its domain says - and a domain that
+        /// is none refused.
+        /// </summary>
+        [Test]
+        public async Task AV2GPKIIsMadeOverTheAPI()
+        {
+
+            await TestPorts.StartedOnFreshPorts(PKIFrom);
+
+            using var admin = await SignedInAs("admin8", "systemadmin");
+
+            var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new { subject = new { commonName = "V2G Root CA", country = "DE" }, v2g = "V2G" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), root.ToString());
+
+            (status, var sub1) = await Post(admin, "api/v1/pki/subCAs", new { issuer = root["id"]!.Value<String>(), subject = new { commonName = "CPO Sub-CA 1" }, v2g = "V2G" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), sub1.ToString());
+
+            (status, var sub2) = await Post(admin, "api/v1/pki/subCAs", new { issuer = sub1["id"]!.Value<String>(), subject = new { commonName = "CPO Sub-CA 2" }, validDays = 365, v2g = "V2G" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), sub2.ToString());
+
+            (status, var secc) = await Post(admin, "api/v1/pki/certificates", new { issuer = sub2["id"]!.Value<String>(), subject = new { commonName = "DE*ABC*E1234567*1" }, validDays = 60, v2g = "CPO" });
+            Assert.That(status, Is.EqualTo(HttpStatusCode.Created), secc.ToString());
+
+            (status, var none) = await Post(admin, "api/v1/pki/rootCAs", new { subject = new { commonName = "Nowhere Root" }, v2g = "EMP" });
+
+            Assert.Multiple(() => {
+                Assert.That(root["keyAlgorithm"]!.Value<String>(),                  Is.EqualTo("ecc-p256"), "the key of ISO 15118 where none is asked for");
+                Assert.That(sub1["pathLength"]!.Value<Int32>(),                     Is.EqualTo(1));
+                Assert.That(sub2["pathLength"]!.Value<Int32>(),                     Is.EqualTo(0));
+                Assert.That(secc["profile"]!.Value<String>(),                       Is.EqualTo("server"), "a SECC certificate is a server's");
+                Assert.That(secc["v2g"]!.Value<String>(),                           Is.EqualTo("CPO"));
+                Assert.That(secc["subject"]!.Value<String>(),                       Does.Contain("DC=CPO"));
+                Assert.That(secc["chain"]!.Select(one => one["v2g"]!.Value<String>()), Is.EqualTo(new[] { "CPO", "V2G", "V2G", "V2G" }));
+                Assert.That(secc["transparency"]!["embedded"]!.Value<Boolean>(),    Is.False, "no timestamps in a certificate of ISO 15118");
+                Assert.That(status,                                                 Is.EqualTo(HttpStatusCode.BadRequest));
+                Assert.That(none["description"]?.ToString() ?? none.ToString(),     Does.Contain("V2G, CPO, MO, OEM, CPS"));
+            });
+
+        }
+
+        #endregion
 
         #region AnybodyAsksWhetherACertificateWasRevoked()
 

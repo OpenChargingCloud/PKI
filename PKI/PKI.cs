@@ -335,7 +335,8 @@ namespace cloud.charging.open.PKI
                               ? $"EST at {ESTPathAt()} signs CSRs{(EST.Default is null ? "" : " without a label")}{(EST.Labels.Count > 0 ? $"{(EST.Default is null ? "" : " and")} at the label(s) {String.Join(", ", EST.Labels.Keys.Select(label => $"'{label}'"))}" : "")}" +
                                 (EST.TLSClientCertificates
                                      ? HTTPS ? ", and asks for a TLS client certificate to renew." : "; it asks for no TLS client certificate, since the PKI speaks no HTTPS of its own."
-                                     : ".")
+                                     : ".") +
+                                (EST.ServerKeyGeneration ? " It makes keys for whoever asks serverkeygen over HTTPS." : "")
                               : $"EST at {ESTPathAt()} signs nothing: the \"{ConfigSection}\" section of the configuration file names no CA for it.",
                           "pki", "est");
 

@@ -48,6 +48,7 @@ namespace cloud.charging.open.PKI
     /// | <c>GET /.well-known/est[/&lt;label&gt;]/cacerts</c> | the CA that signs and those above it, as a certs-only PKCS#7 - to everybody |
     /// | <c>POST /.well-known/est[/&lt;label&gt;]/simpleenroll</c> | a CSR signed: a PKCS#10 in Base64 in, the certificate as a certs-only PKCS#7 in Base64 out |
     /// | <c>POST /.well-known/est[/&lt;label&gt;]/simplereenroll</c> | the same, for whoever renews a certificate of this PKI |
+    /// | <c>POST /.well-known/est[/&lt;label&gt;]/serverkeygen</c> | where it is allowed, and over HTTPS only: a CSR's subject and names signed for a key made here, and the key with the certificate, as multipart/mixed |
     /// | <c>GET /.well-known/est[/&lt;label&gt;]/csrattrs</c> | 204: nothing in particular is asked of a CSR |
     /// | <c>GET v1/pki/est</c>, <c>PUT v1/pki/est</c> | what EST signs, and whether a TLS client certificate is asked for |
     /// </para>
@@ -66,6 +67,16 @@ namespace cloud.charging.open.PKI
     /// CSR". The CA signs without anybody there, so a CA whose key has a
     /// password signs nothing over EST.
     /// </para>
+    /// <para>
+    /// "serverkeygen" is for a station that cannot make a key of its own: the
+    /// key of its CSR, and the signature, only carry the subject, RFC 7030,
+    /// section 4.4.1, and the PKI makes the key - of the kind the CSR was
+    /// signed with, where it makes those - and hands it back unencrypted
+    /// beside the certificate. Over HTTPS only, the PKI's own or that of a
+    /// trusted proxy in front: a private key does not go over plain HTTP. The
+    /// key is kept in the PKI as every key it makes, for whoever may download
+    /// keys. Who may ask is who may enroll or re-enroll.
+    /// </para>
     /// </remarks>
     public partial class PKIHTTPAPI
     {
@@ -80,6 +91,8 @@ namespace cloud.charging.open.PKI
         private static readonly HTTPContentType  PKCS7ContentType       = ContentType("application/pkcs7-mime");
 
         private static readonly String           PKCS7ContentTypeText   = "application/pkcs7-mime; smime-type=certs-only";
+
+        private static readonly HTTPContentType  MultipartContentType   = ContentType("multipart/mixed");
 
         #endregion
 
@@ -108,6 +121,7 @@ namespace cloud.charging.open.PKI
                 est.AddHandler(HTTPPath.Root + label + "cacerts",         ESTCACerts,          HTTPMethod.GET);
                 est.AddHandler(HTTPPath.Root + label + "simpleenroll",    ESTSimpleEnroll,     HTTPMethod.POST);
                 est.AddHandler(HTTPPath.Root + label + "simplereenroll",  ESTSimpleReenroll,   HTTPMethod.POST);
+                est.AddHandler(HTTPPath.Root + label + "serverkeygen",    ESTServerKeyGen,     HTTPMethod.POST);
                 est.AddHandler(HTTPPath.Root + label + "csrattrs",        ESTCSRAttributes,    HTTPMethod.GET);
             }
 
@@ -134,8 +148,9 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// PUT /api/v1/pki/est: what EST signs - {"issuer", "profile",
-        /// "validDays", "labels", "tlsClientCertificates"} - kept in the "pki"
-        /// section of the configuration file; answered as GET is.
+        /// "validDays", "labels", "tlsClientCertificates",
+        /// "serverKeyGeneration"} - kept in the "pki" section of the
+        /// configuration file; answered as GET is.
         /// </summary>
         /// <remarks>
         /// At the permission to make CAs: it has a CA sign without anybody
@@ -296,8 +311,17 @@ namespace cloud.charging.open.PKI
         private Task<HTTPResponse> ESTSimpleReenroll(HTTPRequest Request)
             => Task.FromResult(Enroll(Request, Renewal: true));
 
+        /// <summary>
+        /// POST /.well-known/est[/label]/serverkeygen: a CSR's subject and names
+        /// signed for a key made here, RFC 7030, section 4.4 - a renewal, where
+        /// the certificate renewed is the TLS client certificate.
+        /// </summary>
+        private Task<HTTPResponse> ESTServerKeyGen(HTTPRequest Request)
+            => Task.FromResult(Enroll(Request, Renewal: false, ServerKeyGen: true));
+
         private HTTPResponse Enroll(HTTPRequest  Request,
-                                    Boolean      Renewal)
+                                    Boolean      Renewal,
+                                    Boolean      ServerKeyGen = false)
         {
 
             var label    = LabelOf(Request);
@@ -305,6 +329,12 @@ namespace cloud.charging.open.PKI
 
             if (profile is null)
                 return ESTError(Request, HTTPStatusCode.NotFound, NoEST(Request));
+
+            if (ServerKeyGen && !PKI.EST.ServerKeyGeneration)
+                return ESTError(Request, HTTPStatusCode.NotImplemented, "EST makes no keys here: a station makes its own, and sends its CSR to simpleenroll.");
+
+            if (ServerKeyGen && !PKI.ReachedOverHTTPS(Request))
+                return ESTError(Request, HTTPStatusCode.Forbidden, "A private key goes out over HTTPS only, and this request came over plain HTTP.");
 
             if (Request.ContentType?.MediaType is not "application/pkcs10")
                 return ESTError(Request, HTTPStatusCode.UnsupportedMediaType, "A CSR is sent as application/pkcs10: a PKCS#10 in Base64.");
@@ -314,7 +344,7 @@ namespace cloud.charging.open.PKI
             String               who;
             IssuedCertificate?   renewed = null;
 
-            if (Renewal && Request.ClientCertificate is X509Certificate2 clientCertificate)
+            if ((Renewal || ServerKeyGen) && Request.ClientCertificate is X509Certificate2 clientCertificate)
             {
 
                 renewed = PKI.Store.Get(clientCertificate.GetCertHashString(HashAlgorithmName.SHA256));
@@ -365,7 +395,9 @@ namespace cloud.charging.open.PKI
             if (!PKIStore.TryInspectCSR(csr, out var inspection, out var error))
                 return ESTError(Request, HTTPStatusCode.BadRequest, error);
 
-            if (!inspection.SignatureValid)
+            // Where the PKI makes the key, the CSR's key and signature only
+            // carry the subject, and are not looked at: RFC 7030, 4.4.1.
+            if (!inspection.SignatureValid && !ServerKeyGen)
                 return ESTError(Request, HTTPStatusCode.BadRequest, "The signature of the CSR does not hold.");
 
             if (renewed is not null)
@@ -391,20 +423,31 @@ namespace cloud.charging.open.PKI
             if (ProblemOf(profile.IssuerId) is String problem)
                 return ESTError(Request, HTTPStatusCode.ServiceUnavailable, $"The CA of EST signs nothing: {problem}");
 
-            if (!PKI.Store.TryIssueFromCSR(profile.IssuerId, null, profile.Profile, csr, profile.ValidDays, [], true, null,
-                                           renewed is null ? $"{who.Trim('\'')} (EST)" : $"EST, renewing {renewed.Id}",
-                                           out var certificate, out error, out var notSaved))
-            {
-                return ESTError(Request, notSaved ? HTTPStatusCode.InternalServerError : HTTPStatusCode.BadRequest, error);
-            }
+            var createdBy   = renewed is null ? $"{who.Trim('\'')} (EST)" : $"EST, renewing {renewed.Id}";
 
-            Log.Notice($"EST: {who} {(Renewal ? "re-enrolled" : "enrolled")} the {certificate.Profile.InWords()} '{certificate.CommonName}' ({certificate.Id}) " +
-                       $"below '{PKI.Store.Get(profile.IssuerId)?.CommonName}'{(label is null ? "" : $" at the label '{label}'")}, valid until {certificate.NotAfter:u}.",
+            IssuedCertificate?  certificate;
+            Byte[]?             privateKey  = null;
+            Boolean             notSaved;
+
+            var signed      = ServerKeyGen
+                                  ? PKI.Store.TryIssueWithKeyFor(profile.IssuerId, null, profile.Profile, csr, profile.ValidDays, createdBy,
+                                                                 out certificate, out privateKey, out error, out notSaved)
+                                  : PKI.Store.TryIssueFromCSR   (profile.IssuerId, null, profile.Profile, csr, profile.ValidDays, [], true, null, createdBy,
+                                                                 out certificate, out error, out notSaved);
+
+            if (!signed || certificate is null)
+                return ESTError(Request, notSaved ? HTTPStatusCode.InternalServerError : HTTPStatusCode.BadRequest, error ?? "Nothing was signed.");
+
+            Log.Notice($"EST: {who} {(Renewal || renewed is not null ? "re-enrolled" : "enrolled")} the {certificate.InWords} '{certificate.CommonName}' ({certificate.Id}) " +
+                       $"below '{PKI.Store.Get(profile.IssuerId)?.CommonName}'{(label is null ? "" : $" at the label '{label}'")}" +
+                       $"{(ServerKeyGen ? ", with a key the PKI made" : "")}, valid until {certificate.NotAfter:u}.",
                        "pki", "est", "security");
 
             using var issued = PKI.Store.Load(certificate.Id)!;
 
-            return PKCS7Response(Request, PKCS7.CertsOnly([ issued ]));
+            return privateKey is null
+                       ? PKCS7Response(Request, PKCS7.CertsOnly([ issued ]))
+                       : KeyAndCertificateResponse(Request, privateKey, PKCS7.CertsOnly([ issued ]));
 
         }
 
@@ -469,6 +512,43 @@ namespace cloud.charging.open.PKI
                }.Set("Content-Type",               PKCS7ContentTypeText).
                  Set("Content-Transfer-Encoding",  "base64").
                  WithCommonSecurityHeaders().AsImmutable;
+
+        /// <summary>
+        /// The answer of serverkeygen, RFC 7030, section 4.4.2: multipart/mixed
+        /// of the key - PKCS#8 in Base64, unencrypted, where TLS is what
+        /// protects it - and the certificate, as a certs-only PKCS#7 in Base64.
+        /// </summary>
+        private static HTTPResponse KeyAndCertificateResponse(HTTPRequest  Request,
+                                                              Byte[]       PrivateKey,
+                                                              Byte[]       PKCS7)
+        {
+
+            var boundary = "est-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
+
+            var body = new StringBuilder().
+                           Append("--").Append(boundary).Append("\r\n").
+                           Append("Content-Type: application/pkcs8\r\n").
+                           Append("Content-Transfer-Encoding: base64\r\n\r\n").
+                           Append(Convert.ToBase64String(PrivateKey, Base64FormattingOptions.InsertLineBreaks)).Append("\r\n").
+                           Append("--").Append(boundary).Append("\r\n").
+                           Append("Content-Type: ").Append(PKCS7ContentTypeText).Append("\r\n").
+                           Append("Content-Transfer-Encoding: base64\r\n\r\n").
+                           Append(Convert.ToBase64String(PKCS7, Base64FormattingOptions.InsertLineBreaks)).Append("\r\n").
+                           Append("--").Append(boundary).Append("--\r\n").
+                           ToString();
+
+            // Not even the bytes of the key stay where they need not.
+            CryptographicOperations.ZeroMemory(PrivateKey);
+
+            return new HTTPResponse.Builder(Request) {
+                       HTTPStatusCode  = HTTPStatusCode.OK,
+                       ContentType     = MultipartContentType,
+                       Content         = Encoding.ASCII.GetBytes(body),
+                       CacheControl    = "no-store"
+                   }.Set("Content-Type", $"multipart/mixed; boundary={boundary}").
+                     WithCommonSecurityHeaders().AsImmutable;
+
+        }
 
         private static HTTPResponse ESTError(HTTPRequest     Request,
                                              HTTPStatusCode  StatusCode,

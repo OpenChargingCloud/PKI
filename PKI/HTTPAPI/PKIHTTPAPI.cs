@@ -397,7 +397,8 @@ namespace cloud.charging.open.PKI
 
         /// <summary>
         /// POST /api/v1/pki/rootCAs: a new root CA - {"subject", "keyAlgorithm",
-        /// "validDays", "pathLength", "keyPassword"} - answered 201 with the CA.
+        /// "validDays", "pathLength", "keyPassword", "v2g"} - answered 201 with
+        /// the CA. With "v2g" - "V2G", "MO" or "OEM" - a root CA of ISO 15118.
         /// </summary>
         private Task<HTTPResponse> PostRootCA(HTTPRequest Request)
         {
@@ -408,8 +409,9 @@ namespace cloud.charging.open.PKI
             if (!TryParseJSONObject(Request, out var json, out var errorResponse))
                 return Task.FromResult(errorResponse);
 
-            if (!SubjectName.TryParse(json["subject"], out var subject, out var error) ||
-                !TryReadKeyAlgorithm(json, KeyAlgorithm.ECC_P384, out var keyAlgorithm, out error) ||
+            if (!TryReadV2G         (json,                        out var v2g,          out var error) ||
+                !SubjectName.TryParse(json["subject"],            out var subject,      out error)     ||
+                !TryReadKeyAlgorithm(json, KeyFor(v2g, KeyAlgorithm.ECC_P384), out var keyAlgorithm, out error) ||
                 !TryReadInt32       (json, "validDays",  3650,    out var validDays,    out error)     ||
                 !TryReadOptional    (json, "pathLength",          out var pathLength,   out error)     ||
                 !TryReadPassword    (json, "keyPassword",         out var keyPassword,  out error))
@@ -418,12 +420,12 @@ namespace cloud.charging.open.PKI
             }
 
             if (!PKI.Store.TryCreateRootCA(subject, keyAlgorithm, validDays.Value, pathLength, keyPassword, user.Id.ToString(),
-                                           out var certificate, out error, out var notSaved))
+                                           out var certificate, out error, out var notSaved, v2g))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
             }
 
-            return Task.FromResult(Made(Request, user, certificate, $"made the root CA '{certificate.CommonName}'"));
+            return Task.FromResult(Made(Request, user, certificate, $"made the {certificate.InWords} '{certificate.CommonName}'"));
 
         }
 
@@ -434,8 +436,9 @@ namespace cloud.charging.open.PKI
         /// <summary>
         /// POST /api/v1/pki/subCAs: a new sub-CA below a CA of this PKI -
         /// {"issuer", "issuerKeyPassword", "subject", "keyAlgorithm",
-        /// "validDays", "pathLength", "keyPassword"} - answered 201 with the
-        /// sub-CA.
+        /// "validDays", "pathLength", "keyPassword", "v2g"} - answered 201 with
+        /// the sub-CA. With "v2g" - "V2G", "MO", "OEM" or "CPS" - a sub-CA of
+        /// ISO 15118.
         /// </summary>
         private Task<HTTPResponse> PostSubCA(HTTPRequest Request)
         {
@@ -447,8 +450,9 @@ namespace cloud.charging.open.PKI
                 return Task.FromResult(errorResponse);
 
             if (!TryReadIssuer      (json,                        out var issuer,       out var error) ||
+                !TryReadV2G         (json,                        out var v2g,          out error)     ||
                 !SubjectName.TryParse(json["subject"],            out var subject,      out error)     ||
-                !TryReadKeyAlgorithm(json, KeyAlgorithm.ECC_P384, out var keyAlgorithm, out error)     ||
+                !TryReadKeyAlgorithm(json, KeyFor(v2g, KeyAlgorithm.ECC_P384), out var keyAlgorithm, out error) ||
                 !TryReadInt32       (json, "validDays",  1825,    out var validDays,    out error)     ||
                 !TryReadOptional    (json, "pathLength",          out var pathLength,   out error)     ||
                 !TryReadPassword    (json, "issuerKeyPassword",   out var issuerKey,    out error)     ||
@@ -458,12 +462,12 @@ namespace cloud.charging.open.PKI
             }
 
             if (!PKI.Store.TryIssue(issuer, issuerKey, CertificateProfile.SubCA, subject, keyAlgorithm, validDays.Value, [], pathLength, keyPassword, user.Id.ToString(),
-                                    out var certificate, out error, out var notSaved))
+                                    out var certificate, out error, out var notSaved, v2g))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
             }
 
-            return Task.FromResult(Made(Request, user, certificate, $"made the sub-CA '{certificate.CommonName}' below '{IssuerName(certificate)}'"));
+            return Task.FromResult(Made(Request, user, certificate, $"made the {certificate.InWords} '{certificate.CommonName}' below '{IssuerName(certificate)}'"));
 
         }
 
@@ -475,8 +479,11 @@ namespace cloud.charging.open.PKI
         /// POST /api/v1/pki/certificates: a new certificate for a server or a
         /// client below a CA of this PKI, with a key made here - {"issuer",
         /// "issuerKeyPassword", "profile", "subject", "keyAlgorithm",
-        /// "validDays", "subjectAlternativeNames", "keyPassword"} - answered
-        /// 201 with the certificate.
+        /// "validDays", "subjectAlternativeNames", "keyPassword", "v2g"} -
+        /// answered 201 with the certificate. With "v2g" - "CPO" for a SECC
+        /// certificate, "MO" for a contract certificate, "OEM" for an OEM
+        /// provisioning certificate, "CPS" for the CPS's - one of ISO 15118,
+        /// whose profile follows from it where none is given.
         /// </summary>
         private Task<HTTPResponse> PostCertificate(HTTPRequest Request)
         {
@@ -488,7 +495,8 @@ namespace cloud.charging.open.PKI
                 return Task.FromResult(errorResponse);
 
             if (!TryReadIssuer      (json,                        out var issuer,       out var error) ||
-                !TryReadLeafProfile (json,                        out var profile,      out error)     ||
+                !TryReadV2G         (json,                        out var v2g,          out error)     ||
+                !TryReadLeafProfile (json, v2g,                   out var profile,      out error)     ||
                 !SubjectName.TryParse(json["subject"],            out var subject,      out error)     ||
                 !TryReadKeyAlgorithm(json, KeyAlgorithm.ECC_P256, out var keyAlgorithm, out error)     ||
                 !TryReadInt32       (json, "validDays",  365,     out var validDays,    out error)     ||
@@ -500,12 +508,12 @@ namespace cloud.charging.open.PKI
             }
 
             if (!PKI.Store.TryIssue(issuer, issuerKey, profile, subject, keyAlgorithm, validDays.Value, names, null, keyPassword, user.Id.ToString(),
-                                    out var certificate, out error, out var notSaved))
+                                    out var certificate, out error, out var notSaved, v2g))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
             }
 
-            return Task.FromResult(Made(Request, user, certificate, $"made the {profile.InWords()} '{certificate.CommonName}' below '{IssuerName(certificate)}'"));
+            return Task.FromResult(Made(Request, user, certificate, $"made the {certificate.InWords} '{certificate.CommonName}' below '{IssuerName(certificate)}'"));
 
         }
 
@@ -517,8 +525,8 @@ namespace cloud.charging.open.PKI
         /// POST /api/v1/pki/csr: a certificate below a CA of this PKI for the
         /// key of a certificate signing request - {"issuer", "issuerKeyPassword",
         /// "profile", "csr", "validDays", "subjectAlternativeNames",
-        /// "takeSubjectAlternativeNames", "pathLength"} - answered 201 with the
-        /// certificate.
+        /// "takeSubjectAlternativeNames", "pathLength", "v2g"} - answered 201
+        /// with the certificate; with "v2g", one of ISO 15118.
         /// </summary>
         /// <remarks>
         /// As a server's or a client's certificate at the permission to sign
@@ -534,7 +542,10 @@ namespace cloud.charging.open.PKI
             if (!TryParseJSONObject(Request, out var json, out var errorResponse))
                 return Task.FromResult(errorResponse);
 
-            if (!CertificateProfileExtensions.TryParse(json.Value<String>("profile") ?? "client", out var profile) ||
+            if (!TryReadV2G(json, out var v2g, out var v2gError))
+                return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, v2gError));
+
+            if (!CertificateProfileExtensions.TryParse(json.Value<String>("profile") ?? (v2g is V2GDomain domain ? ISO15118.LeafProfileOf(domain).AsText() : "client"), out var profile) ||
                 profile == CertificateProfile.RootCA)
             {
                 return Task.FromResult(ErrorJSON(Request, HTTPStatusCode.BadRequest, "A CSR is signed as a 'subCA', a 'server' or a 'client'."));
@@ -560,12 +571,12 @@ namespace cloud.charging.open.PKI
             if (!PKI.Store.TryIssueFromCSR(issuer, issuerKey, profile.Value, json.Value<String>("csr")!, validDays.Value, names,
                                            json.Value<Boolean?>("takeSubjectAlternativeNames") ?? true,
                                            pathLength, user.Id.ToString(),
-                                           out var certificate, out error, out var notSaved))
+                                           out var certificate, out error, out var notSaved, v2g))
             {
                 return Task.FromResult(NotChanged(Request, HTTPStatusCode.BadRequest, error, notSaved));
             }
 
-            return Task.FromResult(Made(Request, user, certificate, $"signed a CSR of '{certificate.CommonName}' as a {profile.Value.InWords()} below '{IssuerName(certificate)}'"));
+            return Task.FromResult(Made(Request, user, certificate, $"signed a CSR of '{certificate.CommonName}' as a {certificate.InWords} below '{IssuerName(certificate)}'"));
 
         }
 
@@ -686,7 +697,8 @@ namespace cloud.charging.open.PKI
             json.Add(new JProperty("chain",        new JArray(chain.Select(one => new JObject(
                                                                    new JProperty("id",          one.Id),
                                                                    new JProperty("commonName",  one.CommonName),
-                                                                   new JProperty("profile",     one.Profile.AsText())
+                                                                   new JProperty("profile",     one.Profile.AsText()),
+                                                                   new JProperty("v2g",         one.V2G?.AsText())
                                                                )))));
             json.Add(new JProperty("issuedCount",  PKI.Store.IssuedBy(Certificate.Id).Count));
             json.Add(new JProperty("belowCount",   Below(Certificate.Id).Count));
@@ -751,12 +763,20 @@ namespace cloud.charging.open.PKI
         }
 
         private static Boolean TryReadLeafProfile(JObject                           JSON,
+                                                  V2GDomain?                        V2G,
                                                   out CertificateProfile            Profile,
                                                   [NotNullWhen(false)] out String?  Error)
         {
 
             Profile = CertificateProfile.Client;
             Error   = null;
+
+            // A certificate of ISO 15118 is what its domain says it is.
+            if (V2G is V2GDomain domain && String.IsNullOrWhiteSpace(JSON.Value<String>("profile")))
+            {
+                Profile = ISO15118.LeafProfileOf(domain);
+                return true;
+            }
 
             if (CertificateProfileExtensions.TryParse(JSON.Value<String>("profile"), out var profile) &&
                 profile is CertificateProfile.Server or CertificateProfile.Client)
@@ -769,6 +789,39 @@ namespace cloud.charging.open.PKI
             return false;
 
         }
+
+        /// <summary>
+        /// "v2g": the domain of a certificate of ISO 15118 - left out, null or
+        /// empty for none of ISO 15118.
+        /// </summary>
+        private static Boolean TryReadV2G(JObject                           JSON,
+                                          out V2GDomain?                    V2G,
+                                          [NotNullWhen(false)] out String?  Error)
+        {
+
+            V2G    = null;
+            Error  = null;
+
+            var token = JSON["v2g"];
+
+            if (token is null || token.Type == JTokenType.Null || (token.Type == JTokenType.String && String.IsNullOrWhiteSpace(token.Value<String>())))
+                return true;
+
+            if (token.Type == JTokenType.String && ISO15118.TryParse(token.Value<String>(), out V2G))
+                return true;
+
+            Error = $"'v2g' is the domain of a certificate of ISO 15118: {String.Join(", ", Enum.GetValues<V2GDomain>().Select(domain => domain.AsText()))} - or none.";
+            return false;
+
+        }
+
+        /// <summary>
+        /// The key a certificate is made with where none is asked for: the one
+        /// of ISO 15118 for a certificate of it, the given one otherwise.
+        /// </summary>
+        private static KeyAlgorithm KeyFor(V2GDomain? V2G, KeyAlgorithm Otherwise)
+
+            => V2G is null ? Otherwise : ISO15118.KeyAlgorithm;
 
         private static Boolean TryReadKeyAlgorithm(JObject                                 JSON,
                                                    KeyAlgorithm                            Default,

@@ -56,6 +56,9 @@ namespace cloud.charging.open.PKI
     /// <para>
     /// Nothing is added from outside: there is no add-chain and no
     /// add-pre-chain, and the log has what the PKI signed and nothing else.
+    /// The certificate of a server or a client is in it as its precertificate,
+    /// whose timestamp the certificate carries: get-entries hands out the
+    /// precert_entry and the PrecertChainEntry of RFC 6962 for it.
     /// </para>
     /// <para>
     /// Not open to everybody, as the logs of the web are: the log names every
@@ -361,6 +364,7 @@ namespace cloud.charging.open.PKI
                    ? new JObject(
                          new JProperty("index",     entry.Index),
                          new JProperty("loggedAt",  entry.LoggedAt.ToString("o", CultureInfo.InvariantCulture)),
+                         new JProperty("embedded",  entry.IsPrecertificate),
                          new JProperty("sct",       entry.SCTJSON(PKI.Store.Transparency.LogId))
                      )
                    : null;
@@ -384,6 +388,8 @@ namespace cloud.charging.open.PKI
                        new JProperty("subject",     certificate.Subject),
                        new JProperty("issuer",      certificate.Issuer),
                        new JProperty("profile",     (kept?.Profile ?? ProfileOf(certificate)).AsText()),
+                       new JProperty("v2g",         kept?.V2G?.AsText()),
+                       new JProperty("precertificate", Entry.IsPrecertificate),
                        new JProperty("notAfter",    new DateTimeOffset(certificate.NotAfter.ToUniversalTime(), TimeSpan.Zero).ToString("o", CultureInfo.InvariantCulture)),
                        new JProperty("inPKI",       kept is not null),
                        new JProperty("revoked",     PKI.Store.RevocationOf(Entry.CertificateId) is not null),

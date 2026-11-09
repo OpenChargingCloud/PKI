@@ -36,18 +36,28 @@ namespace cloud.charging.open.PKI.Transparency
     /// above it, and the signature of the log over its timestamp - what
     /// together with the log's id is its signed certificate timestamp.
     /// </summary>
+    /// <remarks>
+    /// An entry of a precertificate is what RFC 6962 calls a precert_entry:
+    /// its leaf is the precertificate's TBSCertificate without its poison and
+    /// the hash of its CA's key, and the timestamp signed is the one the
+    /// certificate carries. The certificate itself is kept beside it, as
+    /// what the PKI signed once the log had signed - and is what the entry
+    /// is found by.
+    /// </remarks>
     /// <param name="Index">Where it is in the log, from 0.</param>
     /// <param name="Timestamp">When the log took it in, in milliseconds since 1970, as RFC 6962 counts.</param>
     /// <param name="CertificateId">Its SHA-256 fingerprint, as the store names it.</param>
     /// <param name="Certificate">The certificate, DER.</param>
     /// <param name="Chain">The CAs above it up to its root, DER; none for a root.</param>
     /// <param name="Signature">The log's signature over its timestamp, as the DigitallySigned of RFC 5246.</param>
+    /// <param name="PreCertificate">The precertificate the timestamp was signed for, DER; null where the certificate itself was.</param>
     public sealed record LogEntry(Int64                  Index,
                                   Int64                  Timestamp,
                                   String                 CertificateId,
                                   Byte[]                 Certificate,
                                   IReadOnlyList<Byte[]>  Chain,
-                                  Byte[]                 Signature)
+                                  Byte[]                 Signature,
+                                  Byte[]?                PreCertificate = null)
     {
 
         /// <summary>
@@ -57,11 +67,35 @@ namespace cloud.charging.open.PKI.Transparency
             => DateTimeOffset.FromUnixTimeMilliseconds(Timestamp);
 
         /// <summary>
+        /// Whether the log signed a precertificate, whose timestamp the
+        /// certificate carries.
+        /// </summary>
+        public Boolean IsPrecertificate
+            => PreCertificate is not null;
+
+        /// <summary>
+        /// What the log signed of a precertificate: its TBSCertificate without
+        /// the poison.
+        /// </summary>
+        public Byte[] PrecertificateTBS
+            => Precertificate.TBSWithout(PreCertificate ?? throw new InvalidOperationException("No precertificate was logged."), Precertificate.PoisonOID);
+
+        /// <summary>
         /// The MerkleTreeLeaf of RFC 6962 - what is hashed into the tree, and
         /// what "leaf_input" of get-entries is.
         /// </summary>
         public Byte[] MerkleTreeLeaf
-            => TLS.MerkleTreeLeaf(Timestamp, Certificate);
+            => IsPrecertificate
+                   ? TLS.PrecertMerkleTreeLeaf(Timestamp, Precertificate.IssuerKeyHash(Chain[0]), PrecertificateTBS)
+                   : TLS.MerkleTreeLeaf(Timestamp, Certificate);
+
+        /// <summary>
+        /// What the log signed: the input of its signed certificate timestamp.
+        /// </summary>
+        public Byte[] SignatureInput
+            => IsPrecertificate
+                   ? TLS.PrecertTimestampInput(Timestamp, Precertificate.IssuerKeyHash(Chain[0]), PrecertificateTBS)
+                   : TLS.CertificateTimestampInput(Timestamp, Certificate);
 
         /// <summary>
         /// The hash of its leaf in the tree.
@@ -70,11 +104,20 @@ namespace cloud.charging.open.PKI.Transparency
             => MerkleTree.LeafHash(MerkleTreeLeaf);
 
         /// <summary>
-        /// The chain above it, as "extra_data" of get-entries is for an
-        /// X509ChainEntry.
+        /// The chain above it, as "extra_data" of get-entries is: an
+        /// X509ChainEntry, or a PrecertChainEntry.
         /// </summary>
         public Byte[] ExtraData
-            => TLS.CertificateChain(Chain);
+            => IsPrecertificate
+                   ? TLS.PrecertChainEntry(PreCertificate!, Chain)
+                   : TLS.CertificateChain(Chain);
+
+        /// <summary>
+        /// The signed certificate timestamp, as TLS writes it - as a
+        /// certificate carries it.
+        /// </summary>
+        public Byte[] SerializedSCT(Byte[] LogId)
+            => TLS.SerializedSCT(LogId, Timestamp, Signature);
 
         /// <summary>
         /// The signed certificate timestamp, as add-chain of RFC 6962 answers
@@ -505,6 +548,124 @@ namespace cloud.charging.open.PKI.Transparency
 
         #endregion
 
+        #region TryAppendPrecertificate(PreCertificate, Chain, Finish, out Certificate, out Entry, out Error)
+
+        /// <summary>
+        /// Take a precertificate in, sign its timestamp, and have the
+        /// certificate made with it - which is kept in the log beside the
+        /// precertificate, and found by. All of it under the log's lock: no
+        /// entry comes between the timestamp and the line written, and a
+        /// certificate the log could not write is never handed out.
+        /// </summary>
+        /// <param name="PreCertificate">The precertificate: the certificate to be, with the poison.</param>
+        /// <param name="Chain">The CAs above it up to its root; the first of them signed it.</param>
+        /// <param name="Finish">What makes the certificate, given its signed certificate timestamp as TLS writes it.</param>
+        public Boolean TryAppendPrecertificate(X509Certificate2                                  PreCertificate,
+                                               IReadOnlyList<X509Certificate2>                   Chain,
+                                               Func<Byte[], X509Certificate2>                    Finish,
+                                               [NotNullWhen(true)]  out X509Certificate2?        Certificate,
+                                               [NotNullWhen(true)]  out LogEntry?                Entry,
+                                               [NotNullWhen(false)] out String?                  Error)
+        {
+
+            Certificate  = null;
+            Entry        = null;
+            Error        = null;
+
+            if (Chain.Count == 0)
+            {
+                Error = "A precertificate is signed by a CA, and none was given.";
+                return false;
+            }
+
+            if (!Precertificate.IsPoisoned(PreCertificate))
+            {
+                Error = "A precertificate carries the poison extension, critical; this one does not.";
+                return false;
+            }
+
+            var tbs            = Precertificate.TBSWithout(PreCertificate.RawData, Precertificate.PoisonOID);
+            var issuerKeyHash  = Precertificate.IssuerKeyHash(Chain[0]);
+
+            lock (gate)
+            {
+
+                if (IsBroken)
+                {
+                    Error = $"The transparency log in '{Directory}' is broken, and takes in nothing until it is repaired: {String.Join(" ", problems)}";
+                    return false;
+                }
+
+                var timestamp  = Math.Max(timeProvider.GetUtcNow().ToUnixTimeMilliseconds(), entries.Count > 0 ? entries[^1].Timestamp : 0);
+                var signature  = Sign(TLS.PrecertTimestampInput(timestamp, issuerKeyHash, tbs));
+
+                X509Certificate2 certificate;
+
+                try
+                {
+                    certificate = Finish(TLS.SerializedSCT(LogId, timestamp, signature));
+                }
+                catch (Exception e)
+                {
+                    Error = $"The certificate could not be made with its signed certificate timestamp: {e.Message}";
+                    return false;
+                }
+
+                // What the log signed has to be what the certificate is, but
+                // for its timestamps: where it is not, the timestamp it
+                // carries holds for nothing.
+                if (!Precertificate.TBSWithout(certificate.RawData, Precertificate.SCTListOID).AsSpan().SequenceEqual(tbs))
+                {
+                    certificate.Dispose();
+                    Error = "The certificate is not what its precertificate said it would be, and was not kept.";
+                    return false;
+                }
+
+                var id = certificate.GetCertHashString(HashAlgorithmName.SHA256).ToLowerInvariant();
+
+                if (byId.ContainsKey(id))
+                {
+                    certificate.Dispose();
+                    Error = $"The log has the certificate {id} already.";
+                    return false;
+                }
+
+                var entry = new LogEntry(
+                                Index:           entries.Count,
+                                Timestamp:       timestamp,
+                                CertificateId:   id,
+                                Certificate:     certificate.RawData,
+                                Chain:           Chain.Select(one => one.RawData).ToList(),
+                                Signature:       signature,
+                                PreCertificate:  PreCertificate.RawData
+                            );
+
+                try
+                {
+                    using var file = new FileStream(EntriesFile, FileMode.Append, FileAccess.Write, FileShare.Read);
+                    var line       = Encoding.UTF8.GetBytes(ToJSON(entry).ToString(Formatting.None) + "\n");
+                    file.Write(line);
+                    file.Flush(flushToDisk: true);
+                }
+                catch (Exception e)
+                {
+                    certificate.Dispose();
+                    Error = $"The precertificate could not be written to the transparency log '{EntriesFile}': {e.Message}";
+                    return false;
+                }
+
+                Add(entry);
+
+                Certificate  = certificate;
+                Entry        = entry;
+                return true;
+
+            }
+
+        }
+
+        #endregion
+
         #region Verifying
 
         /// <summary>
@@ -512,7 +673,23 @@ namespace cloud.charging.open.PKI.Transparency
         /// </summary>
         public Boolean Verify(LogEntry Entry)
 
-            => Verify(TLS.CertificateTimestampInput(Entry.Timestamp, Entry.Certificate), Entry.Signature);
+            => Verify(Entry.SignatureInput, Entry.Signature);
+
+        /// <summary>
+        /// Whether a signed certificate timestamp a certificate carries is one
+        /// of this log, and holds for the certificate - signed by its CA, the
+        /// given one: checked as whoever reads the certificate checks it,
+        /// from the certificate alone.
+        /// </summary>
+        public Boolean Verify(SignedCertificateTimestamp  SCT,
+                              X509Certificate2            Certificate,
+                              X509Certificate2            Issuer)
+
+            => SCT.LogId.AsSpan().SequenceEqual(LogId) &&
+               Verify(TLS.PrecertTimestampInput(SCT.Timestamp,
+                                                Precertificate.IssuerKeyHash(Issuer),
+                                                Precertificate.TBSWithout(Certificate.RawData, Precertificate.SCTListOID)),
+                      SCT.Signature);
 
         /// <summary>
         /// Whether the log's signature over a tree head holds.
@@ -663,15 +840,23 @@ namespace cloud.charging.open.PKI.Transparency
         #region (private static) An entry as a line, and back
 
         private static JObject ToJSON(LogEntry Entry)
+        {
 
-            => new (
-                   new JProperty("index",          Entry.Index),
-                   new JProperty("timestamp",      Entry.Timestamp),
-                   new JProperty("id",             Entry.CertificateId),
-                   new JProperty("certificate",    Convert.ToBase64String(Entry.Certificate)),
-                   new JProperty("chain",          new JArray(Entry.Chain.Select(Convert.ToBase64String))),
-                   new JProperty("signature",      Convert.ToBase64String(Entry.Signature))
-               );
+            var json = new JObject(
+                           new JProperty("index",          Entry.Index),
+                           new JProperty("timestamp",      Entry.Timestamp),
+                           new JProperty("id",             Entry.CertificateId),
+                           new JProperty("certificate",    Convert.ToBase64String(Entry.Certificate)),
+                           new JProperty("chain",          new JArray(Entry.Chain.Select(Convert.ToBase64String))),
+                           new JProperty("signature",      Convert.ToBase64String(Entry.Signature))
+                       );
+
+            if (Entry.PreCertificate is not null)
+                json.Add(new JProperty("precertificate", Convert.ToBase64String(Entry.PreCertificate)));
+
+            return json;
+
+        }
 
         private static LogEntry? TryParse(String Line)
         {
@@ -681,12 +866,15 @@ namespace cloud.charging.open.PKI.Transparency
                 var json = JObject.Parse(Line);
 
                 return new LogEntry(
-                           Index:          json.Value<Int64>("index"),
-                           Timestamp:      json.Value<Int64>("timestamp"),
-                           CertificateId:  json.Value<String>("id")!.ToLowerInvariant(),
-                           Certificate:    Convert.FromBase64String(json.Value<String>("certificate")!),
-                           Chain:          json["chain"]!.Values<String>().Select(one => Convert.FromBase64String(one!)).ToList(),
-                           Signature:      Convert.FromBase64String(json.Value<String>("signature")!)
+                           Index:           json.Value<Int64>("index"),
+                           Timestamp:       json.Value<Int64>("timestamp"),
+                           CertificateId:   json.Value<String>("id")!.ToLowerInvariant(),
+                           Certificate:     Convert.FromBase64String(json.Value<String>("certificate")!),
+                           Chain:           json["chain"]!.Values<String>().Select(one => Convert.FromBase64String(one!)).ToList(),
+                           Signature:       Convert.FromBase64String(json.Value<String>("signature")!),
+                           PreCertificate:  json.Value<String>("precertificate") is String precertificate
+                                                ? Convert.FromBase64String(precertificate)
+                                                : null
                        );
 
             }
@@ -735,6 +923,158 @@ namespace cloud.charging.open.PKI.Transparency
         private const Byte  LeafType_TimestampedEntry    = 0;
         private const Byte  HashAlgorithm_SHA256         = 4;
         private const Byte  SignatureAlgorithm_ECDSA     = 3;
+        private const UInt16 EntryType_Precert           = 1;
+
+        /// <summary>
+        /// MerkleTreeLeaf of a precertificate: version, leaf type, and the
+        /// TimestampedEntry of a PreCert - its timestamp, its entry type, the
+        /// hash of its CA's key, its TBSCertificate without the poison, and no
+        /// extensions.
+        /// </summary>
+        public static Byte[] PrecertMerkleTreeLeaf(Int64 Timestamp, Byte[] IssuerKeyHash, Byte[] TBSCertificate)
+        {
+
+            using var output = new MemoryStream();
+
+            output.WriteByte(Version_V1);
+            output.WriteByte(LeafType_TimestampedEntry);
+            WritePreCert(output, Timestamp, IssuerKeyHash, TBSCertificate);
+
+            return output.ToArray();
+
+        }
+
+        /// <summary>
+        /// What the log signs of a precertificate: version, signature type, its
+        /// timestamp, entry type, the hash of its CA's key, its TBSCertificate
+        /// without the poison, and no extensions.
+        /// </summary>
+        public static Byte[] PrecertTimestampInput(Int64 Timestamp, Byte[] IssuerKeyHash, Byte[] TBSCertificate)
+        {
+
+            using var output = new MemoryStream();
+
+            output.WriteByte(Version_V1);
+            output.WriteByte(SignatureType_Certificate);
+            WritePreCert(output, Timestamp, IssuerKeyHash, TBSCertificate);
+
+            return output.ToArray();
+
+        }
+
+        private static void WritePreCert(Stream Output, Int64 Timestamp, Byte[] IssuerKeyHash, Byte[] TBSCertificate)
+        {
+
+            if (IssuerKeyHash.Length != 32)
+                throw new ArgumentException("The hash of a CA's key is SHA-256: 32 bytes.", nameof(IssuerKeyHash));
+
+            WriteUInt64 (Output, (UInt64) Timestamp);
+            WriteUInt16 (Output, EntryType_Precert);
+            Output.Write(IssuerKeyHash);
+            WriteOpaque24(Output, TBSCertificate);
+            WriteUInt16 (Output, 0);                    // no extensions
+
+        }
+
+        /// <summary>
+        /// PrecertChainEntry: the precertificate, and the chain above it.
+        /// </summary>
+        public static Byte[] PrecertChainEntry(Byte[] PreCertificate, IReadOnlyList<Byte[]> Chain)
+        {
+
+            using var output = new MemoryStream();
+
+            WriteOpaque24(output, PreCertificate);
+            output.Write(CertificateChain(Chain));
+
+            return output.ToArray();
+
+        }
+
+        /// <summary>
+        /// SignedCertificateTimestamp: version, the log's id, the timestamp, no
+        /// extensions, and the DigitallySigned of the log.
+        /// </summary>
+        public static Byte[] SerializedSCT(Byte[] LogId, Int64 Timestamp, Byte[] DigitallySigned)
+        {
+
+            if (LogId.Length != 32)
+                throw new ArgumentException("The id of a log is SHA-256 of its key: 32 bytes.", nameof(LogId));
+
+            using var output = new MemoryStream();
+
+            output.WriteByte(Version_V1);
+            output.Write(LogId);
+            WriteUInt64(output, (UInt64) Timestamp);
+            WriteUInt16(output, 0);                     // no extensions
+            output.Write(DigitallySigned);
+
+            return output.ToArray();
+
+        }
+
+        /// <summary>
+        /// SignedCertificateTimestampList: every timestamp after its length in
+        /// two bytes, and all of them after theirs.
+        /// </summary>
+        public static Byte[] SCTList(IEnumerable<Byte[]> SerializedSCTs)
+        {
+
+            using var list = new MemoryStream();
+
+            foreach (var sct in SerializedSCTs)
+            {
+                WriteUInt16(list, checked((UInt16) sct.Length));
+                list.Write(sct);
+            }
+
+            using var output = new MemoryStream();
+
+            WriteUInt16(output, checked((UInt16) list.Length));
+            list.WriteTo(output);
+
+            return output.ToArray();
+
+        }
+
+        /// <summary>
+        /// The timestamps of a SignedCertificateTimestampList - those of
+        /// version 1; others are passed over.
+        /// </summary>
+        public static IReadOnlyList<SignedCertificateTimestamp> ReadSCTList(ReadOnlySpan<Byte> List)
+        {
+
+            var scts = new List<SignedCertificateTimestamp>();
+
+            if (List.Length < 2 || BinaryPrimitives.ReadUInt16BigEndian(List) != List.Length - 2)
+                throw new FormatException("This is no list of signed certificate timestamps.");
+
+            var rest = List[2..];
+
+            while (rest.Length > 0)
+            {
+
+                var length = BinaryPrimitives.ReadUInt16BigEndian(rest);
+                var sct    = rest.Slice(2, length);
+                rest       = rest[(2 + length)..];
+
+                if (sct[0] != Version_V1)
+                    continue;
+
+                var extensionsLength = BinaryPrimitives.ReadUInt16BigEndian(sct[41..]);
+
+                scts.Add(new SignedCertificateTimestamp(
+                             LogId:       sct.Slice(1, 32).ToArray(),
+                             Timestamp:   (Int64) BinaryPrimitives.ReadUInt64BigEndian(sct[33..]),
+                             Extensions:  sct.Slice(43, extensionsLength).ToArray(),
+                             Signature:   sct[(43 + extensionsLength)..].ToArray()
+                         ));
+
+            }
+
+            return scts;
+
+        }
 
         /// <summary>
         /// MerkleTreeLeaf: version, leaf type, and the TimestampedEntry of an

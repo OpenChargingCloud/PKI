@@ -6,7 +6,9 @@
  * passwords of keys: optional where a key is made, asked for where the CA
  * chosen to sign has one, and given, changed or taken away in the details -
  * and revoking: a certificate revoked from its details, what the Revocation
- * tab lists, and a certificate downloaded with its key as PKCS#12.
+ * tab lists, and a certificate downloaded with its key as PKCS#12 - and the
+ * certificates of ISO 15118: a V2G root made, a SECC certificate below a CA
+ * of it, with neither the key nor the names asked for that ISO 15118 has not.
  */
 
 import { asked, field, open, submit, until, type Asked } from '../../test/pki.ts';
@@ -19,20 +21,21 @@ const { pkiPage } = await import('./pki.ts');
 
 const everything = [ 'authorities:read', 'authorities:edit', 'issuance:read', 'issuance:edit' ];
 
-function certificate(id: string, commonName: string, profile: string, issuerId: string | null, keyEncrypted = false): Record<string, unknown> {
+function certificate(id: string, commonName: string, profile: string, issuerId: string | null, keyEncrypted = false, v2g: string | null = null): Record<string, unknown> {
     return { id, profile, commonName, subject: `CN=${commonName}`, issuer: 'CN=Root', issuerId, serialNumber: '01',
              notBefore: '2026-01-01T00:00:00Z', notAfter: '2036-01-01T00:00:00Z', keyAlgorithm: 'ecc-p384',
              subjectAlternativeNames: [], pathLength: null, hasPrivateKey: true, keyEncrypted, fromCSR: false,
-             createdAt: '2026-01-01T00:00:00Z', createdBy: 'alice', status: 'valid', revokedAt: null, revocationReason: null };
+             createdAt: '2026-01-01T00:00:00Z', createdBy: 'alice', status: 'valid', revokedAt: null, revocationReason: null, v2g };
 }
 
 /** What the details of a certificate add to what its list says. */
 function detailed(found: Record<string, unknown>): Record<string, unknown> {
     return { ...found, pem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', chainPem: '',
-             chain: [ { id: found['id'], commonName: found['commonName'], profile: found['profile'] } ],
+             chain: [ { id: found['id'], commonName: found['commonName'], profile: found['profile'], v2g: found['v2g'] } ],
              issuedCount: 0, belowCount: 0,
              mayDownloadPrivateKey: found['profile'] === 'client' || found['profile'] === 'server',
              transparency: { index: 0, loggedAt: '2026-01-01T00:00:00Z',
+                             embedded: (found['profile'] === 'client' || found['profile'] === 'server') && found['v2g'] === null,
                              sct: { sct_version: 0, id: 'bG9n', timestamp: 0, extensions: '', signature: 'c2ln' } },
              revocation: found['revokedAt'] ? { id: found['id'], issuerId: found['issuerId'], serialNumber: '01', commonName: found['commonName'],
                                                 notAfter: found['notAfter'], revokedAt: found['revokedAt'], reason: found['revocationReason'], revokedBy: 'alice' } : null,
@@ -55,9 +58,9 @@ function revocationOverview(): unknown {
 /** The entries of the stand-in log: what the PKI signed, one of them deleted since. */
 const logged = [
     { index: 0, timestamp: 0, loggedAt: '2026-01-01T00:00:00Z', id: 'aa', commonName: 'OCC Root CA', subject: 'CN=OCC Root CA', issuer: 'CN=OCC Root CA',
-      profile: 'rootCA', notAfter: '2036-01-01T00:00:00Z', inPKI: true },
+      profile: 'rootCA', v2g: null, precertificate: false, notAfter: '2036-01-01T00:00:00Z', inPKI: true },
     { index: 1, timestamp: 0, loggedAt: '2026-01-02T00:00:00Z', id: 'ee', commonName: 'CS-0009',     subject: 'CN=CS-0009',     issuer: 'CN=OCC Root CA',
-      profile: 'client', notAfter: '2027-01-01T00:00:00Z', inPKI: false }
+      profile: 'client', v2g: null, precertificate: true, notAfter: '2027-01-01T00:00:00Z', inPKI: false }
 ];
 
 let certificates: Record<string, unknown>[] = [];
@@ -80,7 +83,7 @@ function pki({ method, path, body }: Asked): unknown {
         return revocationOverview();
 
     if (method === 'GET' && path === '/pki/est')
-        return { issuer: 'aa', profile: 'client', validDays: 365, labels: {}, tlsClientCertificates: false,
+        return { issuer: 'aa', profile: 'client', validDays: 365, labels: {}, tlsClientCertificates: false, serverKeyGeneration: false,
                  enabled: true, path: '/.well-known/est', https: false, issuers: [ { id: 'aa', commonName: 'OCC Root CA', problem: null } ] };
 
     if (method === 'PUT' && path === '/pki/est')
@@ -117,13 +120,14 @@ function pki({ method, path, body }: Asked): unknown {
     }
 
     if (method === 'POST' && path === '/pki/certificates') {
-        const made = certificate('dd', (body as { subject: { commonName: string } }).subject.commonName, 'client', 'aa');
+        const asked = body as { subject: { commonName: string }; profile: string; issuer: string; v2g: string | null };
+        const made  = certificate('dd', asked.subject.commonName, asked.profile, asked.issuer, false, asked.v2g);
         certificates = [ made, ...certificates ];
         return detailed(made);
     }
 
     if (method === 'POST' && path === '/pki/rootCAs') {
-        const made = certificate('cc', (body as { subject: { commonName: string } }).subject.commonName, 'rootCA', null);
+        const made = certificate('cc', (body as { subject: { commonName: string } }).subject.commonName, 'rootCA', null, false, (body as { v2g: string | null }).v2g);
         certificates = [ made, ...certificates ];
         return { ...made, pem: '', chainPem: '', chain: [], issuedCount: 0, belowCount: 0, mayDownloadPrivateKey: false };
     }
@@ -169,6 +173,7 @@ describe('the PKI page', () => {
         assert.ok(asked.some(one => one.method === 'GET' && one.path === '/pki/certificates/aa'));
         assert.match(root.querySelector('#pki-details')!.textContent!, /BEGIN CERTIFICATE/);
         assert.ok(root.querySelector('#pki-delete'), 'an account that may make CAs may delete one');
+        assert.doesNotMatch(root.querySelector('#pki-details-log')!.textContent!, /timestamp in the certificate/, 'a CA carries no timestamp');
         assert.equal(root.querySelector('#pki-download-key'), null, 'the key of a CA is never offered');
 
     });
@@ -445,8 +450,77 @@ describe('the PKI page', () => {
 
         const sent = asked.find(one => one.method === 'PUT' && one.path === '/pki/est')!.body as Record<string, unknown>;
 
-        assert.deepEqual(sent, { issuer: 'aa', profile: 'client', validDays: 365, tlsClientCertificates: false,
+        assert.deepEqual(sent, { issuer: 'aa', profile: 'client', validDays: 365, tlsClientCertificates: false, serverKeyGeneration: false,
                                  labels: { csms: { issuer: 'aa', profile: 'server', validDays: 365 } } });
+
+    });
+
+    it('makes a V2G root of ISO 15118, with the one key it has', async () => {
+
+        certificates = [];
+
+        const root = await open(pkiPage, '/pki?tab=root-ca', everything, pki, root => root.querySelector('#root-ca-form') !== null);
+
+        const v2g = root.querySelector<HTMLSelectElement>('#root-ca-form select[name="v2g"]')!;
+        v2g.value = 'V2G';
+        v2g.dispatchEvent(new Event('change', { bubbles: true }));
+
+        await until(() => root.querySelector('#root-ca-form select[name="keyAlgorithm"]') === null, 'a key was still asked for');
+
+        assert.match(root.querySelector('#root-ca-form .v2g-key')!.textContent!, /ECC P-256/);
+
+        field(root, '#root-ca-form', 'commonName').value = 'V2G Root CA';
+
+        submit(root, '#root-ca-form');
+
+        await until(() => root.querySelector('#pki-made') !== null, 'nothing said the root CA was made');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/rootCAs')!.body as Record<string, unknown>;
+
+        assert.equal(sent['v2g'],           'V2G');
+        assert.equal(sent['keyAlgorithm'],  'ecc-p256');
+        assert.match(root.querySelector('#pki-made')!.textContent!, /V2G root CA/);
+        assert.match(root.querySelector('tr[data-id="cc"]')!.textContent!, /V2G root CA/);
+
+    });
+
+    it('makes a SECC certificate below a CA of ISO 15118, without the names it has not', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null),
+                         certificate('vv', 'CPO Sub-CA 2', 'subCA', 'aa', false, 'V2G') ];
+
+        const root = await open(pkiPage, '/pki?tab=issue', everything, pki, root => root.querySelector('#issue-form') !== null);
+
+        assert.ok(root.querySelector('#issue-form textarea[name="names"]'), 'below a CA of X.509, a certificate has other names');
+
+        const issuer = root.querySelector<HTMLSelectElement>('#issue-form select[name="issuer"]')!;
+        issuer.value = 'vv';
+        issuer.dispatchEvent(new Event('change', { bubbles: true }));
+
+        await until(() => root.querySelector('#issue-form select[name="v2g"]') !== null, 'nothing said it is one of ISO 15118');
+
+        assert.equal(root.querySelector('#issue-form textarea[name="names"]'), null, 'no other names in ISO 15118');
+        assert.equal(root.querySelector('#issue-form select[name="keyAlgorithm"]'), null, 'no key to choose in ISO 15118');
+        assert.match(root.querySelector('#issue-form select[name="v2g"]')!.textContent!, /SECC/);
+
+        field(root, '#issue-form', 'commonName').value = 'DE*ABC*E1234567*1';
+
+        submit(root, '#issue-form');
+
+        await until(() => asked.some(one => one.method === 'POST' && one.path === '/pki/certificates'), 'nothing was asked for');
+
+        const sent = asked.find(one => one.method === 'POST' && one.path === '/pki/certificates')!.body as Record<string, unknown>;
+
+        assert.equal(sent['issuer'],        'vv');
+        assert.equal(sent['v2g'],           'CPO');
+        assert.equal(sent['profile'],       'server', 'a SECC certificate is a server\'s');
+        assert.equal(sent['keyAlgorithm'],  'ecc-p256');
+        assert.deepEqual(sent['subjectAlternativeNames'], []);
+
+        await until(() => root.querySelector('#pki-details-profile') !== null, 'its details were not opened');
+
+        assert.match(root.querySelector('#pki-details-profile')!.textContent!, /SECC.*ISO 15118-2, domain CPO/s);
+        assert.doesNotMatch(root.querySelector('#pki-details-log')!.textContent!, /timestamp in the certificate/, 'none in a certificate of ISO 15118');
 
     });
 

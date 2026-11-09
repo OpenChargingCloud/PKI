@@ -109,19 +109,23 @@ namespace cloud.charging.open.PKI.Enrollment
     /// "est": {
     ///   "issuer": "&lt;fingerprint of a CA&gt;", "profile": "client", "validDays": 365,
     ///   "labels": { "csms": { "issuer": "...", "profile": "server", "validDays": 365 } },
-    ///   "tlsClientCertificates": true
+    ///   "tlsClientCertificates": true, "serverKeyGeneration": false
     /// }
     /// </code>
     /// A request at "/.well-known/est/simpleenroll" is signed as the section
     /// itself says, one at "/.well-known/est/csms/simpleenroll" as its label
     /// "csms" says. Without an issuer, and without labels, EST signs nothing.
+    /// With "serverKeyGeneration", "serverkeygen" makes the key as well, for
+    /// whoever cannot make one of its own.
     /// </remarks>
     /// <param name="Default">What a request without a label is signed as; null for nothing.</param>
     /// <param name="Labels">What a request with a label is signed as, by the label.</param>
     /// <param name="TLSClientCertificates">Whether the HTTPS server of the PKI asks for a TLS client certificate, which re-enrolls a certificate of this PKI with itself.</param>
+    /// <param name="ServerKeyGeneration">Whether "serverkeygen" makes keys: the key of the certificate made here, and handed out with it - over HTTPS only.</param>
     public sealed record ESTSettings(ESTProfile?                              Default,
                                      IReadOnlyDictionary<String, ESTProfile>  Labels,
-                                     Boolean                                  TLSClientCertificates)
+                                     Boolean                                  TLSClientCertificates,
+                                     Boolean                                  ServerKeyGeneration = false)
     {
 
         /// <summary>
@@ -166,6 +170,7 @@ namespace cloud.charging.open.PKI.Enrollment
             json.Add(new JProperty("labels",                 new JObject(Labels.OrderBy(label => label.Key, StringComparer.Ordinal).
                                                                                   Select (label => new JProperty(label.Key, label.Value.ToJSON())))));
             json.Add(new JProperty("tlsClientCertificates",  TLSClientCertificates));
+            json.Add(new JProperty("serverKeyGeneration",    ServerKeyGeneration));
 
             return json;
 
@@ -191,7 +196,7 @@ namespace cloud.charging.open.PKI.Enrollment
 
             if (JSON is not JObject json)
             {
-                Error = "\"est\" is { \"issuer\", \"profile\", \"validDays\", \"labels\", \"tlsClientCertificates\" }.";
+                Error = "\"est\" is { \"issuer\", \"profile\", \"validDays\", \"labels\", \"tlsClientCertificates\", \"serverKeyGeneration\" }.";
                 return false;
             }
 
@@ -232,15 +237,22 @@ namespace cloud.charging.open.PKI.Enrollment
 
             }
 
-            var tls = json["tlsClientCertificates"];
+            var tls     = json["tlsClientCertificates"];
+            var keygen  = json["serverKeyGeneration"];
 
-            if (tls is not null && tls.Type is not JTokenType.Boolean and not JTokenType.Null)
+            foreach (var (name, token) in new[] { ("tlsClientCertificates", tls), ("serverKeyGeneration", keygen) })
             {
-                Error = "\"tlsClientCertificates\" of \"est\" is true or false.";
-                return false;
+                if (token is not null && token.Type is not JTokenType.Boolean and not JTokenType.Null)
+                {
+                    Error = $"\"{name}\" of \"est\" is true or false.";
+                    return false;
+                }
             }
 
-            Settings = new ESTSettings(@default, labels, tls?.Type == JTokenType.Boolean && tls.Value<Boolean>());
+            Settings = new ESTSettings(@default,
+                                       labels,
+                                       tls?.   Type == JTokenType.Boolean && tls.   Value<Boolean>(),
+                                       keygen?.Type == JTokenType.Boolean && keygen.Value<Boolean>());
             return true;
 
         }

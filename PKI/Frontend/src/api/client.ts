@@ -64,6 +64,12 @@ export type CertificateStore = NodeCertificateStore<CertificateKind>;
 /** What a certificate of the PKI is: a root, a CA below one, or a server's or a client's below either. */
 export type CertificateProfile = 'rootCA' | 'subCA' | 'server' | 'client';
 
+/**
+ * The domain of a certificate of ISO 15118-2 - Plug & Charge - as the DomainComponent of its subject says it:
+ * V2G for the V2G root and a CPO's sub-CAs, CPO for the SECC certificate, MO, OEM and CPS for their roots, sub-CAs and certificates.
+ */
+export type V2GDomain = 'V2G' | 'CPO' | 'MO' | 'OEM' | 'CPS';
+
 /** Whether a certificate holds now - a revoked one never again. */
 export type CertificateStatus = 'valid' | 'expired' | 'notYetValid' | 'revoked';
 
@@ -99,6 +105,8 @@ export interface PKICertificate {
     /** When it was revoked, and why; null where it was not. */
     revokedAt:                string | null;
     revocationReason:         RevocationReason | null;
+    /** Its domain, where it is a certificate of ISO 15118; null where it is none. */
+    v2g:                      V2GDomain | null;
 }
 
 /** One certificate, as its details show it. */
@@ -107,7 +115,7 @@ export interface PKICertificateDetails extends PKICertificate {
     /** The certificate and the sub-CAs above it, without the root: what a server or a client presents. */
     chainPem:               string;
     /** The certificate and every CA above it, up to its root. */
-    chain:                  { id: string; commonName: string; profile: CertificateProfile }[];
+    chain:                  { id: string; commonName: string; profile: CertificateProfile; v2g: V2GDomain | null }[];
     /** How many it signed itself, and how many are below it all the way down. */
     issuedCount:            number;
     belowCount:             number;
@@ -188,6 +196,8 @@ export interface SignedCertificateTimestamp {
 export interface CertificateInTheLog {
     index:     number;
     loggedAt:  string;
+    /** Whether the certificate carries its timestamp itself: the log signed its precertificate. */
+    embedded:  boolean;
     sct:       SignedCertificateTimestamp;
 }
 
@@ -223,6 +233,9 @@ export interface LogEntry {
     subject:     string;
     issuer:      string;
     profile:     CertificateProfile;
+    v2g:         V2GDomain | null;
+    /** Whether the log signed its precertificate, whose timestamp the certificate carries. */
+    precertificate:  boolean;
     notAfter:    string;
     /** Whether the PKI still has it: a deleted one stays in the log. */
     inPKI:          boolean;
@@ -262,6 +275,8 @@ export interface NewRootCA {
     validDays:     number;
     pathLength:    number | null;
     keyPassword:   string | null;
+    /** The domain of a root or a sub-CA of ISO 15118; null for none. */
+    v2g:           V2GDomain | null;
 }
 
 /** A new sub-CA, below a CA of this PKI - with the password of that CA's key, where it has one. */
@@ -280,6 +295,8 @@ export interface NewCertificate {
     keyAlgorithm:             string;
     validDays:                number;
     subjectAlternativeNames:  string[];
+    /** The domain of a certificate of ISO 15118 - CPO for a SECC certificate, MO, OEM, CPS; null for none. */
+    v2g:                      V2GDomain | null;
 }
 
 /** A certificate for the key of a CSR. */
@@ -292,6 +309,7 @@ export interface CSRSigning {
     subjectAlternativeNames:      string[];
     takeSubjectAlternativeNames:  boolean;
     pathLength:                   number | null;
+    v2g:                          V2GDomain | null;
 }
 
 /** What a CSR says, before anything is signed. */
@@ -315,6 +333,8 @@ export interface ESTProfile {
 export interface ESTSettings extends Partial<ESTProfile> {
     labels:                 Record<string, ESTProfile>;
     tlsClientCertificates:  boolean;
+    /** Whether serverkeygen makes the key of a station that cannot - over HTTPS only. */
+    serverKeyGeneration:    boolean;
 }
 
 /** The settings, and what the PKI says of them. */

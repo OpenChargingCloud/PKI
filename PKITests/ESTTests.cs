@@ -476,6 +476,136 @@ namespace cloud.charging.open.PKI.Tests
 
         #endregion
 
+        #region AStationWithoutAKeyOfItsOwnIsGivenOne()
+
+        /// <summary>
+        /// serverkeygen, RFC 7030, section 4.4: over HTTPS, for a registrar, the
+        /// subject and the names of a CSR signed for a key the PKI makes - of the
+        /// kind the CSR was signed with - and the key with the certificate, as
+        /// multipart/mixed; not where it is not allowed, and not without TLS.
+        /// </summary>
+        [Test]
+        public async Task AStationWithoutAKeyOfItsOwnIsGivenOne()
+        {
+
+            #region A PKI of HTTPS, a root, and EST that makes keys
+
+            using var webKey   = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            var webRequest     = new CertificateRequest("CN=PKI web interface", webKey, HashAlgorithmName.SHA256);
+            var webNames       = new SubjectAlternativeNameBuilder();
+            webNames.AddIpAddress(System.Net.IPAddress.Loopback);
+            webRequest.CertificateExtensions.Add(webNames.Build());
+
+            using var web      = webRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+            var webFile        = Path.Combine(directory, "web.p12");
+            File.WriteAllBytes(webFile, web.Export(X509ContentType.Pkcs12));
+
+            await TestPorts.StartedOnFreshPorts(() => PKIFrom(NodeArguments.Parse([ "--https", "--import-certificate", $"tlsServerIdentity={webFile}" ])));
+
+            Assert.That(pki!.Store.TryCreateRootCA(new SubjectName("EST Root"), KeyAlgorithm.ECC_P384, 365, null, null, null, out var root, out var error, out _), Is.True, error);
+
+            var registrar = await Account("registrar6", "registrar");
+
+            var handler   = new HttpClientHandler { ServerCertificateCustomValidationCallback = (message, served, chain, errors) => true };
+            using var http = new HttpClient(handler) { BaseAddress = new Uri(pki.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
+
+            async Task<HttpResponseMessage> KeyGen(Byte[] CSR)
+            {
+                using var post = new HttpRequestMessage(HttpMethod.Post, ".well-known/est/serverkeygen") { Content = AsPKCS10(CSR) };
+                post.Headers.Authorization = registrar;
+                return await http.SendAsync(post);
+            }
+
+            // An RSA key in the CSR: an RSA key is made, and the CSR's is not it.
+            using var csrKey  = RSA.Create(2048);
+            var request       = new CertificateRequest("CN=CS-0099", csrKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            var names         = new SubjectAlternativeNameBuilder();
+            names.AddDnsName("cs-0099.example.org");
+            request.CertificateExtensions.Add(names.Build());
+            var csr           = request.CreateSigningRequest();
+
+            Assert.That(pki.TrySetEST(new ESTSettings(new ESTProfile(root!.Id, CertificateProfile.Client, 30), new Dictionary<String, ESTProfile>(), false), out error), Is.True, error);
+
+            using var notAllowed = await KeyGen(csr);
+
+            Assert.That(notAllowed.StatusCode, Is.EqualTo(HttpStatusCode.NotImplemented), "no keys where EST is not told to make them");
+
+            Assert.That(pki.TrySetEST(new ESTSettings(new ESTProfile(root.Id, CertificateProfile.Client, 30), new Dictionary<String, ESTProfile>(), false, ServerKeyGeneration: true), out error), Is.True, error);
+
+            #endregion
+
+            #region The key and the certificate, as multipart/mixed
+
+            using var made = await KeyGen(csr);
+
+            Assert.That(made.StatusCode, Is.EqualTo(HttpStatusCode.OK), await made.Content.ReadAsStringAsync());
+            Assert.That(made.Content.Headers.ContentType?.MediaType, Is.EqualTo("multipart/mixed"));
+
+            var boundary  = made.Content.Headers.ContentType!.Parameters.Single(parameter => parameter.Name == "boundary").Value!.Trim('"');
+            var parts     = (await made.Content.ReadAsStringAsync()).
+                                Split("--" + boundary).
+                                Select(part => part.Trim()).
+                                Where (part => part.Length > 0 && part != "--").
+                                Select(part => part.Split("\r\n\r\n", 2)).
+                                ToDictionary(part => part[0].Split("\r\n").Single(line => line.StartsWith("Content-Type:")).Split(':', 2)[1].Trim(),
+                                             part => Convert.FromBase64String(part[1].Trim()));
+
+            using var key          = RSA.Create();
+            key.ImportPkcs8PrivateKey(parts["application/pkcs8"], out _);
+
+            using var certificate  = PKCS7.ReadCertsOnly(parts["application/pkcs7-mime; smime-type=certs-only"]).Single();
+            using var publicKey    = certificate.GetRSAPublicKey()!;
+            var kept               = pki.Store.Get(Id(certificate))!;
+
+            Assert.Multiple(() => {
+                Assert.That(certificate.Subject,                                   Is.EqualTo("CN=CS-0099"));
+                Assert.That(AlternativeNames.Of(certificate),                      Is.EqualTo(new[] { "cs-0099.example.org" }), "the names of the CSR");
+                Assert.That(publicKey.ExportSubjectPublicKeyInfo(),                Is.EqualTo(key.ExportSubjectPublicKeyInfo()), "for the key handed out");
+                Assert.That(publicKey.ExportSubjectPublicKeyInfo(),                Is.Not.EqualTo(csrKey.ExportSubjectPublicKeyInfo()), "not for the key of the CSR");
+                Assert.That(publicKey.KeySize,                                     Is.EqualTo(2048), "of the kind the CSR was signed with");
+                Assert.That(kept.HasPrivateKey,                                    Is.True, "kept as every key the PKI makes");
+                Assert.That(kept.FromCSR,                                          Is.False);
+                Assert.That(kept.CreatedBy,                                        Does.Contain("registrar6"));
+            });
+
+            #endregion
+
+        }
+
+        #endregion
+
+        #region NoKeyGoesOverPlainHTTP()
+
+        [Test]
+        public async Task NoKeyGoesOverPlainHTTP()
+        {
+
+            await TestPorts.StartedOnFreshPorts(() => PKIFrom());
+
+            Assert.That(pki!.Store.TryCreateRootCA(new SubjectName("EST Root"), KeyAlgorithm.ECC_P256, 365, null, null, null, out var root, out var error, out _), Is.True, error);
+            Assert.That(pki.TrySetEST(new ESTSettings(new ESTProfile(root!.Id, CertificateProfile.Client, 30), new Dictionary<String, ESTProfile>(), false, ServerKeyGeneration: true), out error), Is.True, error);
+
+            var registrar  = await Account("registrar7", "registrar");
+            var (key, csr) = KeyAndCSR("CS-0100");
+
+            using (key)
+            {
+
+                using var http  = new HttpClient { BaseAddress = new Uri(pki.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
+                using var post  = new HttpRequestMessage(HttpMethod.Post, ".well-known/est/serverkeygen") { Content = AsPKCS10(csr) };
+                post.Headers.Authorization = registrar;
+
+                using var refused = await http.SendAsync(post);
+
+                Assert.That(refused.StatusCode,                 Is.EqualTo(HttpStatusCode.Forbidden));
+                Assert.That(pki.Store.Find("CS-0100"),           Is.Empty, "nothing signed, no key made");
+
+            }
+
+        }
+
+        #endregion
+
     }
 
 }
