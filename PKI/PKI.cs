@@ -32,6 +32,7 @@ using cloud.charging.open.protocols.WWCP.Node.Certificates;
 using cloud.charging.open.protocols.WWCP.Node.Configuration;
 using cloud.charging.open.protocols.WWCP.Node.SecureShell;
 
+using cloud.charging.open.PKI.CommandLine;
 using cloud.charging.open.PKI.Enrollment;
 using cloud.charging.open.PKI.Issuance;
 using cloud.charging.open.PKI.Revocation;
@@ -363,6 +364,16 @@ namespace cloud.charging.open.PKI
                            APIPath:     this.HTTPRootPath,
                            Version:     Version
                        );
+
+            #endregion
+
+            #region What somebody signed in over SSH gets
+
+            // A PKI's command line, with its commands beside the node's -
+            // whichever program runs this PKI, not only the program PKICLI.
+            // Before the node starts, as the node asks; a program with a
+            // command line of its own sets another after this.
+            CommandLines = (terminal, caller) => new PKICLI(this, terminal, caller);
 
             #endregion
 

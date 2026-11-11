@@ -15,8 +15,9 @@ pins it beside the libraries it needs, builds it, and runs its tests.
 | `PKI/PKIAccess.cs` | the resources `authorities` and `issuance`, and the roles `operator` and `registrar` |
 | `PKI/Issuance/` | the store of certificates and what makes more of them: profiles, key algorithms, subjects and alternative names |
 | `PKI/HTTPAPI/` | the routes below `v1/pki` |
+| `PKI/CommandLine/` | the PKI's command line, `PKICLI`, and its commands beside the node's - `pki` among them - at the console and for whoever signs in over SSH, whichever program runs the PKI |
 | `PKI/Frontend/` | the web interface, bundled by webpack with what every node shares |
-| `PKITests/` | the store, the API with its roles, and WWCP_Node's conformance suite asked of a PKI |
+| `PKITests/` | the store, the API with its roles, the command line, and WWCP_Node's conformance suite asked of a PKI |
 
 
 ## Your participation
