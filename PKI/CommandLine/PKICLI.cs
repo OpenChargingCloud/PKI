@@ -18,10 +18,13 @@
 #region Usings
 
 using System.Reflection;
+using System.Diagnostics.CodeAnalysis;
 
 using org.GraphDefined.Vanaheimr.CLI;
 
 using cloud.charging.open.protocols.WWCP.Node.CommandLine;
+
+using cloud.charging.open.PKI.Issuance;
 
 #endregion
 
@@ -113,6 +116,75 @@ namespace cloud.charging.open.PKI.CommandLine
 
         #endregion
 
+
+        #region TryFind(Words, out Certificate, out Error)
+
+        /// <summary>
+        /// The one certificate the given words name: by the beginning of its
+        /// fingerprint, as 'pki' writes it, or by its whole common name.
+        /// </summary>
+        /// <remarks>
+        /// A fingerprint first, four characters at least, so that a word of
+        /// hexadecimal digits finds what 'pki' showed; a common name
+        /// otherwise, whatever its case. Where more than one certificate
+        /// answers to it, none is taken: what a command does to a certificate
+        /// is done to the one that was meant.
+        /// </remarks>
+        /// <param name="Words">What was typed: the beginning of a fingerprint, or a common name.</param>
+        /// <param name="Certificate">The certificate.</param>
+        /// <param name="Error">Why there is none, or more than one.</param>
+        public Boolean TryFind(String                                       Words,
+                               [NotNullWhen(true)]  out IssuedCertificate?  Certificate,
+                               [NotNullWhen(false)] out String?             Error)
+        {
+
+            Certificate  = null;
+            Error        = null;
+
+            var text     = Words.Trim();
+            var all      = PKI.Store.Find();
+            var prefix   = PKIStore.Normalized(text);
+
+            var found    = prefix.Length >= 4 && text.All(character => Uri.IsHexDigit(character) || character is ':' or '-')
+                               ? all.Where(certificate => certificate.Id.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToList()
+                               : [];
+
+            if (found.Count == 0)
+                found = [.. all.Where(certificate => certificate.CommonName.Equals(text, StringComparison.OrdinalIgnoreCase))];
+
+            if (found.Count == 1)
+            {
+                Certificate = found[0];
+                return true;
+            }
+
+            Error = found.Count == 0
+                        ? $"No certificate of this PKI has a fingerprint beginning with '{text}', and none is called so. 'pki' lists them."
+                        : $"{found.Count} certificates of this PKI answer to '{text}': {String.Join(", ", found.Select(certificate => $"{certificate.Id[..16]} ({certificate.InWords})"))}. Say the beginning of the fingerprint of one.";
+
+            return false;
+
+        }
+
+        #endregion
+
+        #region (static) PasswordsAreNotTyped(What)
+
+        /// <summary>
+        /// Why something that needs the password of a key is not done at a
+        /// command line, and where it is.
+        /// </summary>
+        /// <remarks>
+        /// A command line keeps what was typed at it - in its history, which
+        /// outlives the session, and on the screen - and a password belongs in
+        /// neither. So no command here takes one.
+        /// </remarks>
+        /// <param name="What">What was not done, and why the key is needed, as the beginning of a sentence.</param>
+        public static String PasswordsAreNotTyped(String What)
+
+            => $"{What}, which has a password - and a command line keeps what is typed at it. The web interface asks for the password.";
+
+        #endregion
 
         #region (protected override) GetPrompt()
 
