@@ -105,7 +105,7 @@ namespace cloud.charging.open.PKI.Tests
             File.WriteAllText(file, NoTimeServers);
 
             pki       = new PKI(
-                            HTTPPort:        IPPort.Parse(port),
+                            HTTPPort:        port,
                             AccountsPath:    Path.Combine(directory, "accounts"),
                             ConfigFile:      new WWCPConfigFile(file),
                             LogToConsole:    false,
@@ -122,7 +122,7 @@ namespace cloud.charging.open.PKI.Tests
         /// A client signed in with a password as an account made for the
         /// purpose, in the group of the given role.
         /// </summary>
-        private async Task<HttpClient> SignedInAs(String Name, String Role)
+        private async Task<HttpClient> SignedInAs(User_Id Name, String Role)
         {
 
             var password = "correct-horse-battery-" + Guid.NewGuid().ToString("N")[..8];
@@ -131,8 +131,8 @@ namespace cloud.charging.open.PKI.Tests
                         organization is Organization, Is.True, "the PKI's organization is not there");
 
             var account = await pki.ExtAPI.CreateUser(
-                                    User_Id.Parse(Name),
-                                    I18NString.Create(Languages.en, Name),
+                                    Name,
+                                    I18NString.Create(Languages.en, Name.ToString()),
                                     SimpleEMailAddress.Parse($"{Name}@localhost"),
                                     User2OrganizationEdgeLabel.IsMember,
                                     (Organization) organization!,
@@ -145,7 +145,7 @@ namespace cloud.charging.open.PKI.Tests
                                 );
 
             Assert.That(account, Is.Not.Null);
-            Assert.That(pki.ExtAPI.TryGetUser(User_Id.Parse(Name), out var stored), Is.True);
+            Assert.That(pki.ExtAPI.TryGetUser(Name, out var stored), Is.True);
             Assert.That(pki.ExtAPI.TryGetUserGroup(UserGroup_Id.Parse(Role), out var group), Is.True, $"the PKI has no group '{Role}'");
             Assert.That((await pki.ExtAPI.AddUserToUserGroup((User) stored!, User2UserGroupEdgeLabel.IsMember, (UserGroup) group!)).IsSuccess, Is.True);
 
@@ -195,8 +195,8 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(PKIFrom);
 
-            using var admin      = await SignedInAs("admin1",     "systemadmin");
-            using var registrar  = await SignedInAs("registrar1", "registrar");
+            using var admin      = await SignedInAs(User_Id.Parse("admin1"),     "systemadmin");
+            using var registrar  = await SignedInAs(User_Id.Parse("registrar1"), "registrar");
 
             #region A root, and a sub-CA below it
 
@@ -328,8 +328,8 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(PKIFrom);
 
-            using var admin      = await SignedInAs("admin2",     "systemadmin");
-            using var registrar  = await SignedInAs("registrar2", "registrar");
+            using var admin      = await SignedInAs(User_Id.Parse("admin2"),     "systemadmin");
+            using var registrar  = await SignedInAs(User_Id.Parse("registrar2"), "registrar");
 
             var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new {
                                      subject      = new { commonName = "Locked Root" },
@@ -452,8 +452,8 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(PKIFrom);
 
-            using var admin     = await SignedInAs("admin3",    "systemadmin");
-            using var operator_ = await SignedInAs("operator3", "operator");
+            using var admin     = await SignedInAs(User_Id.Parse("admin3"),    "systemadmin");
+            using var operator_ = await SignedInAs(User_Id.Parse("operator3"), "operator");
 
             const String ct = "api/v1/pki/transparency/ct/v1";
 
@@ -589,7 +589,7 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(PKIFrom);
 
-            using var admin = await SignedInAs("admin8", "systemadmin");
+            using var admin = await SignedInAs(User_Id.Parse("admin8"), "systemadmin");
 
             var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new { subject = new { commonName = "V2G Root CA", country = "DE" }, v2g = "V2G" });
             Assert.That(status, Is.EqualTo(HttpStatusCode.Created), root.ToString());
@@ -636,9 +636,9 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(PKIFrom);
 
-            using var admin      = await SignedInAs("admin4",     "systemadmin");
-            using var registrar  = await SignedInAs("registrar4", "registrar");
-            using var operator_  = await SignedInAs("operator4",  "operator");
+            using var admin      = await SignedInAs(User_Id.Parse("admin4"),     "systemadmin");
+            using var registrar  = await SignedInAs(User_Id.Parse("registrar4"), "registrar");
+            using var operator_  = await SignedInAs(User_Id.Parse("operator4"),  "operator");
             using var anybody    = new HttpClient { BaseAddress = address, Timeout = TimeSpan.FromSeconds(30) };
 
             var (status, root) = await Post(admin, "api/v1/pki/rootCAs", new { subject = new { commonName = "Revocation Root" } });
@@ -778,7 +778,7 @@ namespace cloud.charging.open.PKI.Tests
             Assert.That(pki!.Store.TryCreateRootCA(new Issuance.SubjectName("Root"), Issuance.KeyAlgorithm.ECC_P256, 365, null, null, null,
                                                    out var root, out var error, out _), Is.True, error);
 
-            using var @operator = await SignedInAs("operator1", "operator");
+            using var @operator = await SignedInAs(User_Id.Parse("operator1"), "operator");
 
             var (status, all) = await Get(@operator, "api/v1/pki/certificates");
 

@@ -105,7 +105,7 @@ namespace cloud.charging.open.PKI.Tests
 
             File.WriteAllText(file, NoTimeServers);
 
-            pki = new PKI(HTTPPort:        IPPort.Parse(TestPorts.Free()),
+            pki = new PKI(HTTPPort:        TestPorts.Free(),
                           AccountsPath:    Path.Combine(directory, "accounts"),
                           ConfigFile:      new WWCPConfigFile(file),
                           LogToConsole:    false,
@@ -123,15 +123,15 @@ namespace cloud.charging.open.PKI.Tests
         /// An account made for the purpose, in the group of the given role, and
         /// the HTTP Basic credentials it signs in with.
         /// </summary>
-        private async Task<AuthenticationHeaderValue> Account(String Name, String Role)
+        private async Task<AuthenticationHeaderValue> Account(User_Id Name, String Role)
         {
 
             var password = "correct-horse-battery-" + Guid.NewGuid().ToString("N")[..8];
 
             Assert.That(pki!.ExtAPI.TryGetOrganization(Organization_Id.Parse("PKI"), out var organization), Is.True);
 
-            await pki.ExtAPI.CreateUser(User_Id.Parse(Name),
-                                        I18NString.Create(Languages.en, Name),
+            await pki.ExtAPI.CreateUser(Name,
+                                        I18NString.Create(Languages.en, Name.ToString()),
                                         SimpleEMailAddress.Parse($"{Name}@localhost"),
                                         User2OrganizationEdgeLabel.IsMember,
                                         (Organization) organization!,
@@ -142,7 +142,7 @@ namespace cloud.charging.open.PKI.Tests
                                         AcceptedEULA:              DateTimeOffset.UtcNow.AddSeconds(-1),
                                         IsAuthenticated:           true);
 
-            Assert.That(pki.ExtAPI.TryGetUser(User_Id.Parse(Name), out var stored), Is.True);
+            Assert.That(pki.ExtAPI.TryGetUser(Name, out var stored), Is.True);
             Assert.That(pki.ExtAPI.TryGetUserGroup(UserGroup_Id.Parse(Role), out var group), Is.True);
             Assert.That((await pki.ExtAPI.AddUserToUserGroup((User) stored!, User2UserGroupEdgeLabel.IsMember, (UserGroup) group!)).IsSuccess, Is.True);
 
@@ -275,9 +275,9 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(() => PKIFrom());
 
-            var admin      = await Account("admin5",     "systemadmin");
-            var registrar  = await Account("registrar5", "registrar");
-            var operator_  = await Account("operator5",  "operator");
+            var admin      = await Account(User_Id.Parse("admin5"),     "systemadmin");
+            var registrar  = await Account(User_Id.Parse("registrar5"), "registrar");
+            var operator_  = await Account(User_Id.Parse("operator5"),  "operator");
 
             using var http = new HttpClient { BaseAddress = new Uri(pki!.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
 
@@ -547,7 +547,7 @@ namespace cloud.charging.open.PKI.Tests
 
             Assert.That(pki!.Store.TryCreateRootCA(new SubjectName("EST Root"), KeyAlgorithm.ECC_P384, 365, null, null, null, out var root, out var error, out _), Is.True, error);
 
-            var registrar = await Account("registrar6", "registrar");
+            var registrar = await Account(User_Id.Parse("registrar6"), "registrar");
 
             var handler   = new HttpClientHandler { ServerCertificateCustomValidationCallback = (message, served, chain, errors) => true };
             using var http = new HttpClient(handler) { BaseAddress = new Uri(pki.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
@@ -632,8 +632,8 @@ namespace cloud.charging.open.PKI.Tests
 
             await TestPorts.StartedOnFreshPorts(() => PKIFrom());
 
-            var admin      = await Account("admin8",     "systemadmin");
-            var registrar  = await Account("registrar8", "registrar");
+            var admin      = await Account(User_Id.Parse("admin8"),     "systemadmin");
+            var registrar  = await Account(User_Id.Parse("registrar8"), "registrar");
 
             using var http = new HttpClient { BaseAddress = new Uri(pki!.WebInterfaceURL.ToString()), Timeout = TimeSpan.FromSeconds(30) };
 
@@ -825,7 +825,7 @@ namespace cloud.charging.open.PKI.Tests
                                        out var error), Is.True, error);
             Assert.That(pki.EST.For("secc")!.V2G, Is.EqualTo(V2GDomain.CPO), "what its CA signs");
 
-            var registrar = await Account("registrar9", "registrar");
+            var registrar = await Account(User_Id.Parse("registrar9"), "registrar");
 
             #endregion
 
@@ -926,7 +926,7 @@ namespace cloud.charging.open.PKI.Tests
             Assert.That(pki!.Store.TryCreateRootCA(new SubjectName("EST Root"), KeyAlgorithm.ECC_P256, 365, null, null, null, out var root, out var error, out _), Is.True, error);
             Assert.That(pki.TrySetEST(new ESTSettings(new ESTProfile(root!.Id, CertificateProfile.Client, 30), new Dictionary<String, ESTProfile>(), false, ServerKeyGeneration: true), out error), Is.True, error);
 
-            var registrar  = await Account("registrar7", "registrar");
+            var registrar  = await Account(User_Id.Parse("registrar7"), "registrar");
             var (key, csr) = KeyAndCSR("CS-0100");
 
             using (key)

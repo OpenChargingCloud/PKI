@@ -145,7 +145,7 @@ namespace cloud.charging.open.PKI.Tests
 
                 File.WriteAllText(configFile, NoTimeServers);
 
-                var made        = new PKI(HTTPPort:        IPPort.Parse(TestPorts.Free()),
+                var made        = new PKI(HTTPPort:        TestPorts.Free(),
                                           AccountsPath:    Path.Combine(directory, "accounts"),
                                           ConfigFile:      new WWCPConfigFile(configFile),
                                           LogToConsole:    false,
@@ -174,7 +174,7 @@ namespace cloud.charging.open.PKI.Tests
 
             using var page          = await http.GetAsync("");
             using var signIn        = await http.PostAsync("ext/login", new FormUrlEncodedContent([
-                                                                            new KeyValuePair<String, String>("login",     PKI.DefaultAdminUser),
+                                                                            new KeyValuePair<String, String>("login",     PKI.DefaultAdminUser.ToString()),
                                                                             new KeyValuePair<String, String>("password",  pki.GeneratedPassword!)
                                                                         ]));
             using var certificates  = await http.GetAsync("api/v1/pki/certificates");

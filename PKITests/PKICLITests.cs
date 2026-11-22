@@ -104,7 +104,7 @@ namespace cloud.charging.open.PKI.Tests
             File.WriteAllText(file, NoTimeServers);
 
             pki = new PKI(
-                      HTTPPort:        IPPort.Parse(TestPorts.Free()),
+                      HTTPPort:        TestPorts.Free(),
                       AccountsPath:    Path.Combine(directory, "accounts"),
                       ConfigFile:      new WWCPConfigFile(file),
                       LogToConsole:    false,
@@ -135,7 +135,7 @@ namespace cloud.charging.open.PKI.Tests
         /// The command line an account of the given name gets over SSH - in
         /// the group of the given role, or in none.
         /// </summary>
-        private async Task<PKICLI> OverSSHAs(String   Name,
+        private async Task<PKICLI> OverSSHAs(User_Id  Name,
                                              String?  Role)
         {
 
@@ -143,8 +143,8 @@ namespace cloud.charging.open.PKI.Tests
                         organization is Organization, Is.True, "the PKI's organization is not there");
 
             await pki.ExtAPI.CreateUser(
-                      User_Id.Parse(Name),
-                      I18NString.Create(Languages.en, Name),
+                      Name,
+                      I18NString.Create(Languages.en, Name.ToString()),
                       SimpleEMailAddress.Parse($"{Name}@localhost"),
                       User2OrganizationEdgeLabel.IsMember,
                       (Organization) organization!,
@@ -156,7 +156,7 @@ namespace cloud.charging.open.PKI.Tests
                       IsAuthenticated:           true
                   );
 
-            Assert.That(pki.ExtAPI.TryGetUser(User_Id.Parse(Name), out var account), Is.True, $"the account '{Name}' was not made");
+            Assert.That(pki.ExtAPI.TryGetUser(Name, out var account), Is.True, $"the account '{Name}' was not made");
 
             if (Role is not null)
             {
@@ -272,11 +272,11 @@ namespace cloud.charging.open.PKI.Tests
 
             var (_, server) = ARootAndAServer();
 
-            using var @operator = await OverSSHAs("operator1", "operator");
+            using var @operator = await OverSSHAs(User_Id.Parse("operator1"), "operator");
 
             Assert.That(await Run(@operator, "pki csms"), Has.Some.Contains(server.Id[..16]));
 
-            using var nobody = await OverSSHAs("nobody1", null);
+            using var nobody = await OverSSHAs(User_Id.Parse("nobody1"), null);
 
             var refused = (await Run(nobody, "pki")).Single();
 
@@ -560,9 +560,9 @@ namespace cloud.charging.open.PKI.Tests
             Assert.That(pki!.Store.TryIssue(root.Id, null, CertificateProfile.SubCA, new SubjectName("CLI Sub"), KeyAlgorithm.ECC_P256, 200,
                                             [], null, null, null, out var sub, out var error, out _), Is.True, error);
 
-            using var @operator = await OverSSHAs("operator2",  "operator");
-            using var registrar = await OverSSHAs("registrar2", "registrar");
-            using var nobody    = await OverSSHAs("nobody2",    null);
+            using var @operator = await OverSSHAs(User_Id.Parse("operator2"),  "operator");
+            using var registrar = await OverSSHAs(User_Id.Parse("registrar2"), "registrar");
+            using var nobody    = await OverSSHAs(User_Id.Parse("nobody2"),    null);
 
             foreach (var looking in new[] { $"pkiShow {server.Id[..12]}", "pkiRevoked", "pkiCRL", "pkiEST" })
             {

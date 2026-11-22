@@ -53,7 +53,7 @@ namespace cloud.charging.open.PKI.Tests
             File.WriteAllText(file, Configuration.ToString());
 
             return new PKI(
-                       HTTPPort:          IPPort.Parse(TestPorts.Free()),
+                       HTTPPort:          TestPorts.Free(),
                        AccountsPath:      Path.Combine(Directory, "accounts"),
                        ConfigFile:        new WWCPConfigFile(file),
                        CertificatesPath:  Path.Combine(Directory, "certificates"),
