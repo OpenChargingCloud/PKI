@@ -67,7 +67,7 @@ namespace cloud.charging.open.PKI
     /// server and the log - is the node below.
     /// </para>
     /// </remarks>
-    public class PKI : WWCPNode
+    public partial class PKI : WWCPNode
     {
 
         #region Data
@@ -236,6 +236,10 @@ namespace cloud.charging.open.PKI
                    Frontend:           Frontend ?? new EmbeddedContentSource(HTTPRoot, typeof(PKI).Assembly),
                    CertificatesPath:   CertificatesPath,
                    CertificateKinds:   CertificateKinds,
+                   // The WebSocket port of the registration authorities is told
+                   // apart from the web interface: a CSMS is shown what a device
+                   // PKI issued for it, a browser what a browser believes.
+                   CertificateListeners:  [ RAListener ],
                    Log:                Log,
                    LogToConsole:       LogToConsole,
                    ConsoleLogLevel:    ConsoleLogLevel,
@@ -367,6 +371,13 @@ namespace cloud.charging.open.PKI
 
             #endregion
 
+            #region The registration authorities that connect over a WebSocket or over SSH
+
+            // Nothing listens yet - OnListening does. See PKI.RegistrationAuthorities.cs.
+            BuildRAServer();
+
+            #endregion
+
             #region What somebody signed in over SSH gets
 
             // A PKI's command line, with its commands beside the node's -
@@ -400,10 +411,24 @@ namespace cloud.charging.open.PKI
 
         #endregion
 
+        #region (protected override) OnListening()
+
+        /// <summary>
+        /// Begin listening for the registration authorities that connect over a
+        /// WebSocket or over SSH, once the web interface has its port.
+        /// </summary>
+        protected override Task OnListening()
+
+            => StartRAServer();
+
+        #endregion
+
         #region (protected override) OnStopping()
 
         protected override async Task OnStopping()
         {
+
+            await StopRAServer();
 
             if (revocationTimer is not null)
                 await revocationTimer.DisposeAsync();
