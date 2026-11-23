@@ -679,6 +679,7 @@ namespace cloud.charging.open.PKI
                        PKIActions.GetCertificateStatus  => GetCertificateStatus(       GetCertificateStatusRequest.Parse(Payload)).ToJSON(),
                        PKIActions.GetCRL                => GetCRL              (       GetCRLRequest.              Parse(Payload)).ToJSON(),
                        PKIActions.RevokeCertificate     => RevokeCertificate   (Login, RevokeCertificateRequest.   Parse(Payload)).ToJSON(),
+                       PKIActions.GetOCSPResponse       => GetOCSPResponse     (       GetOCSPResponseRequest.     Parse(Payload)).ToJSON(),
                        _                                => throw new PKIException(PKIErrorCodes.NotImplemented, $"'{Action}' is nothing a PKI is asked: {String.Join(", ", PKIActions.All)}.")
                    });
 
@@ -759,6 +760,30 @@ namespace cloud.charging.open.PKI
                                                     certificate.Id,
                                                     revocation?.RevokedAt,
                                                     revocation is null ? null : RevocationReasons.AsText(revocation.Reason));
+
+        }
+
+        #endregion
+
+        #region (private) GetOCSPResponse(Request)
+
+        /// <summary>
+        /// What the OCSP responder of the PKI answers to the request, as it
+        /// answers over HTTP: signed by the responder of the one CA it asks
+        /// about. Rejected, with the unsigned answer, where it asks about no
+        /// CA of this PKI or is no OCSP request.
+        /// </summary>
+        private GetOCSPResponseResponse GetOCSPResponse(GetOCSPResponseRequest Request)
+        {
+
+            var answer = Store.AnswerOCSP(Request.DER);
+            var status = OCSP.TryParseResponse(answer, out var read, out _) ? read.Status : OCSPResponseStatus.InternalError;
+
+            return status switch {
+                       OCSPResponseStatus.Unauthorized      => new GetOCSPResponseResponse(PKIStatus.Rejected, Convert.ToBase64String(answer), new PKIStatusInfo("UnknownCA",          "The OCSP request asks about no CA of this PKI.")),
+                       OCSPResponseStatus.MalformedRequest  => new GetOCSPResponseResponse(PKIStatus.Rejected, Convert.ToBase64String(answer), new PKIStatusInfo("InvalidOCSPRequest", "That is no OCSP request.")),
+                       _                                    => new GetOCSPResponseResponse(PKIStatus.Accepted, Convert.ToBase64String(answer))
+                   };
 
         }
 
