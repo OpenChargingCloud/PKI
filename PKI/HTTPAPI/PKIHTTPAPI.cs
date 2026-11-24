@@ -116,6 +116,7 @@ namespace cloud.charging.open.PKI
             this.PKI = PKI;
 
             RegisterURLTemplates();
+            RegisterRegistrationAuthorityURLTemplates();
 
         }
 

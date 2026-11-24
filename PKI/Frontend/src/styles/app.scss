@@ -7,6 +7,11 @@
     $color-accent-dark:  #55307f
 );
 
+// The registration authorities - their connections, logins and accepted
+// chains - are drawn by the pages every node with a WebSocket server shares,
+// and look as they do there.
+@use '@node/connecting/styles/connections';
+
 
 // The filter above the list: a text and a profile, side by side where there
 // is room for both.

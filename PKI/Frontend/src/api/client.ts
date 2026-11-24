@@ -20,9 +20,10 @@ export * from '@node/api/client';
 
 /**
  * What a role may be allowed to touch on this PKI: what every node has, and
- * its certificate authorities and what they sign.
+ * its certificate authorities, what they sign, and the registration
+ * authorities that connect to it.
  */
-export type Resource = NodeResource | 'authorities' | 'issuance';
+export type Resource = NodeResource | 'authorities' | 'issuance' | 'registrationAuthorities';
 
 /** What somebody signed in to this PKI may do: an operation on a resource, written "issuance:edit". */
 export type Permission = `${Resource}:${Operation}`;
@@ -389,4 +390,42 @@ export const api = {
         setEST:      (settings: ESTSettings)           => request<ESTOverview>           ('PUT',    '/pki/est', settings)
     }
 
+};
+
+
+/**
+ * The WebSocket server the registration authorities connect to - a CSMS that
+ * has the CSRs of its charging stations signed here -, as the PKI answers at
+ * "/configuration/ra-server". Its logins, their groups and the chains a
+ * client certificate may lead to are every WebSocket server's, below it: see
+ * WWCP_Node's connecting/api/webSocketLogins.
+ */
+export interface RAServer {
+    /** The "webSocketServer" section, every field filled in: "enabled", "port", "clientAuthentication", "ssh", ... */
+    configuration:  {
+        enabled?:               boolean;
+        address?:               string;
+        port?:                  number;
+        clientAuthentication?:  ('httpAuthWithoutTLS' | 'httpAuthOverTLS' | 'tlsClientCertificate')[];
+        checkCertificateRevocation?: boolean;
+        ssh?:                   { enabled: boolean };
+    };
+    state: {
+        /** Whether the WebSocket server is listening. */
+        running:  boolean;
+        /** Whether its port speaks TLS. */
+        tls:      boolean;
+        /** Whether the messages of a PKI are served over SSH, on the PKI's SSH server. */
+        ssh:      boolean;
+        sshPort:  number | null;
+    };
+    /** The logins connected now, over a WebSocket or SSH. */
+    connected:  string[];
+    /** How many certificates each login had signed. */
+    signed:     Record<string, number>;
+}
+
+/** How the server of the registration authorities is asked. Changed in the file, and nowhere else. */
+export const raServerAPI = {
+    get: () => request<RAServer>('GET', '/configuration/ra-server')
 };

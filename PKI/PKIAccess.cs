@@ -65,9 +65,18 @@ namespace cloud.charging.open.PKI
         public const String  Issuance     = "issuance";
 
         /// <summary>
-        /// Both.
+        /// The registration authorities that connect over a WebSocket or SSH:
+        /// read, who may connect, with what, and who is connected; edited, a
+        /// registration authority let in, changed or shut out - and the server
+        /// they connect to. Who may let one in may have CSRs signed in its
+        /// name, so neither the operator nor a registrar edits it.
         /// </summary>
-        public static readonly IReadOnlyList<String>  Resources = [ Authorities, Issuance ];
+        public const String  RegistrationAuthorities  = "registrationAuthorities";
+
+        /// <summary>
+        /// All three.
+        /// </summary>
+        public static readonly IReadOnlyList<String>  Resources = [ Authorities, Issuance, RegistrationAuthorities ];
 
         #endregion
 
