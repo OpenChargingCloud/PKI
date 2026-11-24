@@ -280,7 +280,8 @@ namespace cloud.charging.open.PKI
             WebSocketLogins  = new WebSocketLogins(
                                    Path.Combine(directory, WebSocketLogins.DefaultFileName),
                                    TimeProvider,
-                                   NodeNoun
+                                   NodeNoun,
+                                   ClientTrust.ClientNoun
                                );
 
             WebSocketLogins.OnNotice += (level, message) => Log.Log(level, message, "pki", "ra", "auth");
