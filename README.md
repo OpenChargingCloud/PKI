@@ -1,5 +1,7 @@
 # PKI
 
+![The EV charging test environment, the PKI (PKI) highlighted](docs/EVChargingTestEnvironment.svg)
+
 The public key infrastructure of the OpenChargingCloud: a
 [WWCP_Node](https://github.com/OpenChargingCloud/WWCP_Node) that makes X.509
 certificates - root CAs, sub-CAs, certificates for servers and clients, and
