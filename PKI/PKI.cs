@@ -169,6 +169,22 @@ namespace cloud.charging.open.PKI
         /// </summary>
         public ESTSettings EST    { get; private set; } = ESTSettings.None;
 
+        /// <summary>
+        /// What the ACME server at "/acme/directory" signs - see
+        /// <see cref="ACMESettings"/>.
+        /// </summary>
+        public ACMESettings   ACME           { get; private set; } = ACMESettings.None;
+
+        /// <summary>
+        /// The accounts of the ACME server, and its orders.
+        /// </summary>
+        public ACMEState      ACMEState      { get; }
+
+        /// <summary>
+        /// What looks at the challenges of ACME: http-01 and dns-01.
+        /// </summary>
+        public ACMEValidator  ACMEValidator  { get; }
+
         #endregion
 
         #region Constructor(s)
@@ -347,6 +363,40 @@ namespace cloud.charging.open.PKI
 
             #endregion
 
+            #region What ACME signs, and for whom
+
+            this.ACMEState      = new ACMEState(Path.Combine(Store.Directory, "acme", "accounts.json"), this.TimeProvider);
+            this.ACMEValidator  = new ACMEValidator(this.DNSClient);
+
+            if (ACMEState.LoadError is String acmeLoadError)
+                this.Log.Error($"PKI: {acmeLoadError} - ACME opens no account and signs nothing for the accounts it had until it is repaired.", "pki", "acme");
+
+            if (document?[ConfigSection] is JObject acmeSection)
+            {
+                if (ACMESettings.TryParse(acmeSection["acme"], out var acme, out var acmeError) &&
+                    TryACMEBelow(acme, out acmeError))
+                {
+                    ACME = acme;
+                }
+                else
+                    this.Log.Warning($"PKI: the \"acme\" of the \"{ConfigSection}\" section of '{this.ConfigFile.Path}' was passed over, and ACME signs nothing: {acmeError}", "pki", "acme", "configuration");
+            }
+
+            this.Log.Info(ACME.Enabled
+                              ? $"ACME at {ACMEDirectoryAt()} signs certificates{(ACME.Default is null ? "" : " by default")}" +
+                                $"{(ACME.Profiles.Count > 0 ? $"{(ACME.Default is null ? "" : " and")} as the profile(s) {String.Join(", ", ACME.Profiles.Keys.Select(profile => $"'{profile}'"))}" : "")}" +
+                                (ACME.AllowedNames.Count == 0 ? " for every name proven" : $" for {String.Join(", ", ACME.AllowedNames)}") +
+                                $" by {String.Join(" or ", ACME.Challenges)}" +
+                                (ACME.ExternalAccountRequired ? ", to accounts opened with a key of the PKI only" : "") +
+                                $"; it has {ACMEState.Accounts().Count(account => account.Status == "valid")} account(s)."
+                              : $"ACME at {ACMEDirectoryAt()} signs nothing: the \"{ConfigSection}\" section of the configuration file names no CA for it.",
+                          "pki", "acme");
+
+            if (ACME.OpenToEverybody)
+                this.Log.Warning($"PKI: {ACMESettings.OpenToEverybodyWarning}", "pki", "acme", "security");
+
+            #endregion
+
             #region The JSON API
 
             this.Log.Info(
@@ -434,6 +484,8 @@ namespace cloud.charging.open.PKI
                 await revocationTimer.DisposeAsync();
 
             revocationTimer = null;
+
+            ACMEValidator.Dispose();
 
             await base.OnStopping();
 
@@ -597,6 +649,77 @@ namespace cloud.charging.open.PKI
         public String ESTPathAt()
 
             => new Uri(WebInterfaceURL.ToString()).GetLeftPart(UriPartial.Authority) + PKIHTTPAPI.ESTPath;
+
+        #endregion
+
+        #region TrySetACME(Settings, out Error)
+
+        /// <summary>
+        /// What the ACME server signs from now on - kept in the "acme" of the
+        /// "pki" section of the configuration file.
+        /// </summary>
+        /// <remarks>
+        /// A CA that is not one of this PKI is refused, and so is one of ISO
+        /// 15118, whose certificates have no names to prove; one whose key has
+        /// a password, or is not here, is taken, and signs nothing over ACME
+        /// until that changes - which the JSON API says beside it.
+        /// </remarks>
+        public Boolean TrySetACME(ACMESettings                      Settings,
+                                  [NotNullWhen(false)] out String?  Error)
+        {
+
+            if (!TryACMEBelow(Settings, out Error))
+                return false;
+
+            if (!ConfigFile.TryMergeSection(ConfigSection, new JObject(new JProperty("acme", Settings.ToJSON())), out Error))
+                return false;
+
+            ACME = Settings;
+            return true;
+
+        }
+
+        /// <summary>
+        /// Whether every CA the settings name is one of this PKI ACME may sign
+        /// with: a CA of X.509.
+        /// </summary>
+        private Boolean TryACMEBelow(ACMESettings                      Settings,
+                                     [NotNullWhen(false)] out String?  Error)
+        {
+
+            foreach (var (where, profile) in new[] { ("by default", Settings.Default) }.
+                                                 Concat(Settings.Profiles.Select(named => ($"as the profile '{named.Key}'", (ACMEProfile?) named.Value))))
+            {
+
+                if (profile is null)
+                    continue;
+
+                if (Store.Get(profile.IssuerId) is not IssuedCertificate ca || !ca.Profile.IsCA())
+                {
+                    Error = $"There is no CA '{profile.IssuerId}' in this PKI to sign over ACME {where}.";
+                    return false;
+                }
+
+                if (ca.V2G is not null)
+                {
+                    Error = $"ACME {where} signs no certificate below '{ca.CommonName}', which is a CA of ISO 15118: its certificates have no names to prove.";
+                    return false;
+                }
+
+            }
+
+            Error = null;
+            return true;
+
+        }
+
+        /// <summary>
+        /// Where the directory of the ACME server is, as a client would be
+        /// pointed at it.
+        /// </summary>
+        public String ACMEDirectoryAt()
+
+            => new Uri(WebInterfaceURL.ToString()).GetLeftPart(UriPartial.Authority) + PKIHTTPAPI.ACMEPath + "/directory";
 
         #endregion
 

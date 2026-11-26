@@ -8,7 +8,9 @@
  * and revoking: a certificate revoked from its details, what the Revocation
  * tab lists, and a certificate downloaded with its key as PKCS#12 - and the
  * certificates of ISO 15118: a V2G root made, a SECC certificate below a CA
- * of it, with neither the key nor the names asked for that ISO 15118 has not.
+ * of it, with neither the key nor the names asked for that ISO 15118 has not -
+ * and ACME: what it signs saved with a profile added, a key of an external
+ * account binding made and said once, and an account deactivated.
  */
 
 import { asked, field, open, submit, until, type Asked } from '../../test/pki.ts';
@@ -65,6 +67,9 @@ const logged = [
 
 let certificates: Record<string, unknown>[] = [];
 
+let acmeAccounts: Record<string, unknown>[] = [];
+let acmeKeys:     Record<string, unknown>[] = [];
+
 function pki({ method, path, body }: Asked): unknown {
 
     if (method === 'GET' && path === '/pki/certificates')
@@ -85,6 +90,33 @@ function pki({ method, path, body }: Asked): unknown {
     if (method === 'GET' && path === '/pki/est')
         return { issuer: 'aa', profile: 'client', validDays: 365, labels: {}, tlsClientCertificates: false, serverKeyGeneration: false,
                  enabled: true, path: '/.well-known/est', https: false, issuers: [ { id: 'aa', commonName: 'OCC Root CA', problem: null } ] };
+
+    if (method === 'GET' && path === '/pki/acme')
+        return { issuer: 'aa', profile: 'server', validDays: 90, profiles: {}, externalAccountRequired: false, allowedNames: [ 'lab.example.org' ],
+                 challenges: [ 'http-01', 'dns-01' ], http01Port: 80, termsOfService: null,
+                 enabled: true, path: '/acme/directory', https: false, issuers: [ { id: 'aa', commonName: 'OCC Root CA', problem: null } ],
+                 accounts: 1, externalAccountKeys: 0, problem: null, warning: null };
+
+    if (method === 'PUT' && path === '/pki/acme')
+        return { ...(body as Record<string, unknown>), enabled: true, path: '/acme/directory', https: false, issuers: [], accounts: 1, externalAccountKeys: 0, problem: null, warning: null };
+
+    if (method === 'GET' && path === '/pki/acme/accounts')
+        return acmeAccounts;
+
+    if (method === 'DELETE' && path.startsWith('/pki/acme/accounts/')) {
+        acmeAccounts = acmeAccounts.map(account => ({ ...account, status: 'deactivated' }));
+        return { id: path.split('/').pop(), status: 'deactivated' };
+    }
+
+    if (method === 'GET' && path === '/pki/acme/eab')
+        return acmeKeys;
+
+    if (method === 'POST' && path === '/pki/acme/eab') {
+        const key = { kid: 'kid-0123456789abcdef01234567', description: (body as { description: string | null }).description,
+                      createdAt: '2026-11-26T00:00:00Z', createdBy: 'alice', boundTo: null };
+        acmeKeys = [ key ];
+        return { ...key, hmacKey: 'c2VjcmV0LW1hYy1rZXktdGhhdC1pcy1zYWlkLW9uY2U', directory: 'http://pki.example.org/acme/directory' };
+    }
 
     if (method === 'PUT' && path === '/pki/est')
         return { ...(body as Record<string, unknown>), enabled: true, path: '/.well-known/est', https: false, issuers: [] };
@@ -455,6 +487,61 @@ describe('the PKI page', () => {
 
     });
 
+    it('says what ACME signs, saves a profile added, makes a key said once and deactivates an account', async () => {
+
+        certificates = [ certificate('aa', 'OCC Root CA', 'rootCA', null),
+                         certificate('ab', 'OCC Sub CA',  'subCA',  'aa'),
+                         certificate('vv', 'V2G Root',    'rootCA', null, false, 'V2G') ];
+
+        acmeAccounts = [ { id: '0011223344556677', status: 'valid', contact: [ 'mailto:csms@example.org' ], thumbprint: 'tp', keyType: 'EC P-256',
+                           createdAt: '2026-11-01T00:00:00Z', externalAccount: null, vouchedForBy: null, certificates: 2 } ];
+        acmeKeys     = [];
+
+        const root = await open(pkiPage, '/pki?tab=acme', everything, pki, root => root.querySelector('#acme-form') !== null);
+
+        assert.match(root.querySelector('#pki-acme-address')!.textContent!, /\/acme\/directory$/);
+        assert.equal(field(root, '#acme-form', 'issuer').value, 'aa');
+        assert.ok(![ ...root.querySelectorAll<HTMLOptionElement>('#acme-form select[name="issuer"] option') ].some(option => option.value === 'vv'),
+                  'a CA of ISO 15118 signs nothing over ACME');
+
+        root.querySelector<HTMLButtonElement>('#acme-add-profile')!.click();
+
+        await until(() => root.querySelector('table.acme-profiles tbody tr') !== null, 'no profile was added');
+
+        const name = root.querySelector<HTMLInputElement>('table.acme-profiles input[name="profile-0"]')!;
+        name.value = 'shortlived';
+        name.dispatchEvent(new Event('input', { bubbles: true }));
+
+        const days = root.querySelector<HTMLInputElement>('table.acme-profiles input[aria-label="Days"]')!;
+        days.value = '7';
+        days.dispatchEvent(new Event('input', { bubbles: true }));
+
+        submit(root, '#acme-form');
+
+        await until(() => asked.some(one => one.method === 'PUT' && one.path === '/pki/acme'), 'nothing was saved');
+
+        const sent = asked.find(one => one.method === 'PUT' && one.path === '/pki/acme')!.body as Record<string, unknown>;
+
+        assert.deepEqual(sent, { issuer: 'aa', profile: 'server', validDays: 90,
+                                 profiles: { shortlived: { issuer: 'aa', profile: 'server', validDays: 7, description: null } },
+                                 externalAccountRequired: false, allowedNames: [ 'lab.example.org' ], challenges: [ 'http-01', 'dns-01' ],
+                                 http01Port: 80, termsOfService: null });
+
+        field(root, '#acme-key-form', 'description').value = 'CSMS 1';
+        submit(root, '#acme-key-form');
+
+        await until(() => root.querySelector('#acme-key-made') !== null, 'no key was said');
+
+        assert.equal(root.querySelector('#acme-key-hmac')!.textContent, 'c2VjcmV0LW1hYy1rZXktdGhhdC1pcy1zYWlkLW9uY2U');
+        assert.ok(root.querySelector('table.acme-keys tr[data-kid="kid-0123456789abcdef01234567"]') !== null, 'the key is listed');
+
+        root.querySelector<HTMLButtonElement>('table.acme-accounts tr[data-account="0011223344556677"] button')!.click();
+
+        await until(() => asked.some(one => one.method === 'DELETE' && one.path === '/pki/acme/accounts/0011223344556677'), 'nothing was deactivated');
+        await until(() => root.querySelector('table.acme-accounts tr[data-account="0011223344556677"] button') === null, 'the account still offers to be deactivated');
+
+    });
+
     it('has EST below a CA of ISO 15118 sign what that CA signs', async () => {
 
         certificates = [ certificate('aa', 'OCC Root CA',  'rootCA', null),
@@ -566,8 +653,8 @@ describe('the PKI page', () => {
                                 root => root.querySelector('table.pki-list') !== null);
 
         assert.equal(root.querySelector('form'), null);
-        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency', 'tab-revocation', 'tab-est' ],
-                         'the list, the log, what was revoked and what EST signs, which are read as the list is');
+        assert.deepEqual([ ...root.querySelectorAll('[role="tab"]') ].map(tab => tab.id), [ 'tab-certificates', 'tab-transparency', 'tab-revocation', 'tab-est', 'tab-acme' ],
+                         'the list, the log, what was revoked and what EST and ACME sign, which are read as the list is');
         assert.match(root.querySelector('.notice')!.textContent!, /may look at the certificates of this PKI but not sign any/);
 
     });

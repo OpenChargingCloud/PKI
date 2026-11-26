@@ -304,7 +304,7 @@ namespace cloud.charging.open.PKI.Tests
 
             var help = String.Join(Environment.NewLine, await Run(cli, "help"));
 
-            foreach (var command in new[] { "pki", "pkiShow", "pkiRevoke", "pkiRevoked", "pkiCRL", "pkiSignCRL", "pkiEST" })
+            foreach (var command in new[] { "pki", "pkiShow", "pkiRevoke", "pkiRevoked", "pkiCRL", "pkiSignCRL", "pkiEST", "pkiACME" })
             {
                 Assert.That(String.Join(" | ", await cli.Execute(command)), Does.Not.StartWith("Unknown command"), command);
                 Assert.That(help, Does.Contain(command + " "), $"'help' does not name {command}");
@@ -536,6 +536,54 @@ namespace cloud.charging.open.PKI.Tests
             Assert.That(lines[2],  Is.EqualTo($"  'servers'        a {CertificateProfile.Server.InWords()} of 60 days below 'CLI Root' ({root.Id[..16]})"));
             Assert.That(lines[3],  Is.EqualTo("No TLS client certificate is asked for."));
             Assert.That(lines[4],  Is.EqualTo("serverkeygen makes no keys."));
+
+        }
+
+        #endregion
+
+        #region PkiACMESaysWhatACMESigns_AndMakesAKey()
+
+        /// <summary>
+        /// 'pkiACME' says that ACME signs nothing where no CA is named for it,
+        /// and otherwise what it signs by default and as each profile, for
+        /// which names; 'pkiACME newKey' makes a key of an external account
+        /// binding, said once, and 'pkiACME accounts' lists the accounts.
+        /// </summary>
+        [Test]
+        public async Task PkiACMESaysWhatACMESigns_AndMakesAKey()
+        {
+
+            PKIFrom();
+
+            using var cli = new PKICLI(pki!);
+
+            Assert.That((await Run(cli, "pkiACME")).Single(), Does.Match("^ACME at http.*/acme/directory signs nothing: no CA is named for it\\.$"));
+
+            var (root, _) = ARootAndAServer();
+
+            Assert.That(Enrollment.ACMESettings.TryParse(Newtonsoft.Json.Linq.JObject.Parse($$"""
+                                                             { "issuer": "{{root.Id}}", "validDays": 30, "externalAccountRequired": true,
+                                                               "allowedNames": [ "lab.example.org" ],
+                                                               "profiles": { "short": { "issuer": "{{root.Id}}", "validDays": 7 } } }
+                                                             """), out var settings, out var error), Is.True, error);
+            Assert.That(pki!.TrySetACME(settings!, out error), Is.True, error);
+
+            var lines = await Run(cli, "pkiACME");
+
+            Assert.That(lines[0],  Does.Match("^ACME at http.*/acme/directory signs:$"));
+            Assert.That(lines[1],  Is.EqualTo($"  by default  a {CertificateProfile.Server.InWords()} of 30 days below 'CLI Root' ({root.Id[..16]})"));
+            Assert.That(lines[2],  Is.EqualTo($"  'short'     a {CertificateProfile.Server.InWords()} of 7 days below 'CLI Root' ({root.Id[..16]})"));
+            Assert.That(lines[3],  Is.EqualTo("for lab.example.org and the names below them"));
+            Assert.That(lines[5],  Does.StartWith("to accounts opened with a key of an external account binding only - 0 not used yet"));
+
+            var made = await Run(cli, "pkiACME newKey CSMS 1");
+
+            Assert.That(made[1],   Does.Match("^  kid       kid-[0-9a-f]{24}$"));
+            Assert.That(made[2],   Does.Match("^  hmacKey   [A-Za-z0-9_-]{43}$"));
+            Assert.That(pki.ACMEState.ExternalAccountKeys().Single().Description, Is.EqualTo("CSMS 1"));
+
+            Assert.That((await Run(cli, "pkiACME accounts")).Single(), Is.EqualTo("ACME has no account yet."));
+            Assert.That((await Run(cli, "pkiACME nonsense")).Single(), Does.StartWith("Usage: pkiACME"));
 
         }
 

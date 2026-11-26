@@ -1,5 +1,10 @@
 import { api,
          apiURL,
+         type ACMEAccount,
+         type ACMEExternalAccountKey,
+         type ACMEExternalAccountKeyMade,
+         type ACMEOverview,
+         type ACMEProfile,
          type CertificateProfile,
          type CSRInspection,
          type ESTOverview,
@@ -48,6 +53,12 @@ import { html, nothing, render, repeat, type TemplateResult } from '@node/view';
  * station sends, signed without anybody here - below which CA and as what,
  * without a label and at each label; and whether it makes the key of a station
  * that cannot make its own.
+ *
+ * The ACME tab says what the ACME server of RFC 8555 signs - the certificate
+ * of a server whose client proves its names by http-01 or dns-01, and renews
+ * it without anybody here - by default and as each profile, for which names;
+ * the keys of external account bindings a client opens its account with, one
+ * made here and said once; and the accounts, one deactivated for good.
  *
  * A root CA may be one of ISO 15118-2, Plug & Charge: a V2G, MO or OEM root.
  * Below it the forms make certificates of ISO 15118 only - the domain of a
@@ -252,10 +263,11 @@ export const pkiPage: Page = {
             { id: 'csr',           label: 'Sign a CSR',       icon: 'fa-file-import'    },
             { id: 'transparency',  label: 'Transparency log', icon: 'fa-scroll'         },
             { id: 'revocation',    label: 'Revocation',       icon: 'fa-ban'            },
-            { id: 'est',           label: 'EST',              icon: 'fa-robot'          }
+            { id: 'est',           label: 'EST',              icon: 'fa-robot'          },
+            { id: 'acme',          label: 'ACME',             icon: 'fa-arrows-rotate'  }
         ];
 
-        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency' || tab.id === 'revocation' || tab.id === 'est'
+        const tabs = allTabs.filter(tab => tab.id === 'certificates' || tab.id === 'transparency' || tab.id === 'revocation' || tab.id === 'est' || tab.id === 'acme'
                                         || ((tab.id === 'root-ca' || tab.id === 'sub-ca') && mayMakeCAs)
                                         ||  (tab.id === 'issue'                          && maySign)
                                         ||  (tab.id === 'csr'                            && (maySign || mayMakeCAs)));
@@ -297,6 +309,15 @@ export const pkiPage: Page = {
         /** The CA chosen to sign without a label, as the form has it. */
         let estDefaultIssuer                               = '';
 
+        /** What ACME signs, its profiles as they are being edited, its accounts and its keys - and the key made last, said once. */
+        let acme:            ACMEOverview | null           = null;
+        let acmeProblem                                    = '';
+        let acmeProfiles:    (ACMEProfile & { name: string })[] = [];
+        let acmeDefaultIssuer                              = '';
+        let acmeAccounts:    ACMEAccount[]                 = [];
+        let acmeKeys:        ACMEExternalAccountKey[]      = [];
+        let acmeKeyMade:     ACMEExternalAccountKeyMade | null = null;
+
         /** The CA each form has chosen to sign, by the id of the form; its first where none was. */
         const issuerChosen: Record<string, string> = {};
 
@@ -320,6 +341,8 @@ export const pkiPage: Page = {
                 void loadRevocation();
             if (id === 'est')
                 void loadEST();
+            if (id === 'acme')
+                void loadACME();
         }
 
         /** Every certificate, or those the filter lets through. */
@@ -393,6 +416,10 @@ export const pkiPage: Page = {
 
                 <section class="tab-panel" role="tabpanel" id="panel-est" aria-labelledby="tab-est" ?hidden=${shown !== 'est'}>
                     ${estView(pki)}
+                </section>
+
+                <section class="tab-panel" role="tabpanel" id="panel-acme" aria-labelledby="tab-acme" ?hidden=${shown !== 'acme'}>
+                    ${acmeView(pki)}
                 </section>
 
             `);
@@ -2028,6 +2055,376 @@ export const pkiPage: Page = {
 
 
         // ------------------------------------------------------------------
+        // ACME
+        // ------------------------------------------------------------------
+
+        /** The CAs ACME may sign with: every CA of X.509 of the PKI - none of ISO 15118, whose certificates have no names to prove. */
+        function acmeIssuerOptions(pki: PKICertificates, Chosen: string | undefined): TemplateResult {
+            return html`${pki.certificates.filter(certificate => (certificate.profile === 'rootCA' || certificate.profile === 'subCA') && !certificate.v2g).map(ca => html`
+                <option value="${ca.id}" ?selected=${ca.id === Chosen}>${ca.commonName} - ${kindOf(ca)}${ca.keyEncrypted ? ', its key with a password' : ''}</option>
+            `)}`;
+        }
+
+        function acmeAs(Profile: 'server' | 'client' | undefined, Name: string | null, OnChange: (Profile: 'server' | 'client') => void): TemplateResult {
+            return html`
+                <select name=${Name ?? nothing} aria-label="As" ?disabled=${!mayMakeCAs}
+                        @change=${(event: Event) => OnChange((event.currentTarget as HTMLSelectElement).value as 'server' | 'client')}>
+                    <option value="server" ?selected=${Profile !== 'client'}>server</option>
+                    <option value="client" ?selected=${Profile === 'client'}>client</option>
+                </select>`;
+        }
+
+        function acmeView(pki: PKICertificates): TemplateResult {
+
+            if (acmeProblem.length > 0)
+                return html`<div class="error-box">${acmeProblem}</div>`;
+
+            if (acme === null)
+                return html`<div class="loading">Loading ...</div>`;
+
+            const overview  = acme;
+            const address   = `${location.origin}${overview.path}`;
+
+            return html`
+                <section class="card" id="pki-acme">
+
+                    <h2><i class="fa-solid fa-arrows-rotate"></i> Automatic Certificate Management Environment</h2>
+
+                    <p class="hint">
+                        ACME of RFC 8555 - what Let's Encrypt speaks - signs the certificate of a server whose ACME client proves
+                        that its names are its own: by <code>http-01</code>, a token on port 80 of the name, or by <code>dns-01</code>,
+                        a TXT record below it. The client renews it without anybody here. What is signed is a certificate for the names
+                        of the order exactly, with nothing else of the CSR but its key. A CA whose key has a password signs nothing over
+                        ACME. Point certbot, acme.sh, Caddy or Hermod's ACME client at the address below.
+                    </p>
+
+                    <div class="kv"><span class="k">Directory</span><span class="v"><code id="pki-acme-address">${address}</code></span></div>
+                    <div class="kv"><span class="k">Signs</span><span class="v" id="pki-acme-state">${overview.enabled
+                        ? html`<span class="chip ok">yes</span> <span class="muted">${overview.accounts} account(s)</span>`
+                        : html`<span class="chip warn">nothing</span> <span class="muted">until it is told a CA</span>`}</span></div>
+
+                    ${overview.problem !== null ? html`<div class="error-box">${overview.problem}</div>` : nothing}
+
+                    ${overview.warning !== null ? html`<div class="notice" id="pki-acme-warning">${overview.warning}</div>` : nothing}
+
+                    ${overview.issuers.filter(issuer => issuer.problem !== null).map(issuer => html`
+                        <div class="notice acme-problem">'${issuer.commonName ?? issuer.id}' signs nothing over ACME: ${issuer.problem}</div>
+                    `)}
+
+                    ${!overview.https ? html`
+                        <div class="notice">RFC 8555 has ACME spoken over HTTPS. This PKI speaks no HTTPS of its own: put a proxy that ends TLS in front of it, or give it --https.</div>
+                    ` : nothing}
+
+                    <form id="acme-form" class="form-stack" @submit=${onACME}>
+
+                        <h3>By default - an order that names no profile</h3>
+
+                        <div class="est-profile">
+                            <label>Signed by
+                                <select name="issuer" ?disabled=${!mayMakeCAs}
+                                        @change=${(event: Event) => { acmeDefaultIssuer = (event.currentTarget as HTMLSelectElement).value; draw(); }}>
+                                    <option value="" ?selected=${acmeDefaultIssuer === ''}>nobody - an order names its profile</option>
+                                    ${acmeIssuerOptions(pki, acmeDefaultIssuer)}
+                                </select>
+                            </label>
+                            <label>As
+                                ${acmeAs(overview.profile, 'profile', () => {})}
+                            </label>
+                            <label>Valid for (days)
+                                <input type="number" name="validDays" min="1" max="${pki.maxValidityDays}" value="${overview.validDays ?? 90}" ?disabled=${!mayMakeCAs} />
+                            </label>
+                        </div>
+
+                        <h3>Profiles - what an order may name as its "profile"</h3>
+
+                        ${acmeProfiles.length === 0 ? html`<p class="hint">No profile.</p>` : html`
+                            <div class="table-scroll">
+                                <table class="records acme-profiles">
+                                    <thead><tr><th>Name</th><th>Signed by</th><th>As</th><th>Days</th><th>Description</th><th></th></tr></thead>
+                                    <tbody>
+                                        ${acmeProfiles.map((row, at) => html`
+                                            <tr data-profile="${row.name}">
+                                                <td><input name="profile-${at}" .value=${row.name} required pattern="[A-Za-z0-9][A-Za-z0-9_.\\-]{0,63}" aria-label="Name" ?disabled=${!mayMakeCAs}
+                                                           @input=${(event: Event) => { row.name = (event.currentTarget as HTMLInputElement).value; }} /></td>
+                                                <td><select aria-label="Signed by" ?disabled=${!mayMakeCAs}
+                                                            @change=${(event: Event) => { row.issuer = (event.currentTarget as HTMLSelectElement).value; draw(); }}>
+                                                        ${acmeIssuerOptions(pki, row.issuer)}
+                                                    </select></td>
+                                                <td>${acmeAs(row.profile, null, profile => { row.profile = profile; })}</td>
+                                                <td><input type="number" min="1" max="${pki.maxValidityDays}" .value=${String(row.validDays)} aria-label="Days" ?disabled=${!mayMakeCAs}
+                                                           @input=${(event: Event) => { row.validDays = Number((event.currentTarget as HTMLInputElement).value); }} /></td>
+                                                <td><input .value=${row.description ?? ''} aria-label="Description" ?disabled=${!mayMakeCAs}
+                                                           @input=${(event: Event) => { row.description = (event.currentTarget as HTMLInputElement).value; }} /></td>
+                                                <td>${mayMakeCAs ? html`<button type="button" class="btn small danger" @click=${() => { acmeProfiles.splice(at, 1); draw(); }}>Remove</button>` : nothing}</td>
+                                            </tr>
+                                        `)}
+                                    </tbody>
+                                </table>
+                            </div>`}
+
+                        ${mayMakeCAs ? html`
+                            <div>
+                                <button type="button" class="btn small" id="acme-add-profile"
+                                        @click=${() => { acmeProfiles.push({ name: '', issuer: acme?.issuer ?? pki.certificates.find(one => (one.profile === 'subCA' || one.profile === 'rootCA') && !one.v2g)?.id ?? '', profile: 'server', validDays: 90, description: null }); draw(); }}>
+                                    <i class="fa-solid fa-plus"></i> Add a profile
+                                </button>
+                            </div>` : nothing}
+
+                        <h3>For which names, proven how</h3>
+
+                        <label>Names it signs for - one per line: a domain stands for itself and every name below it, an address with its prefix length for its network; none for every name proven
+                            <textarea name="allowedNames" rows="3" placeholder="lab.example.org" ?disabled=${!mayMakeCAs} .value=${overview.allowedNames.join('\n')}></textarea>
+                        </label>
+
+                        <label class="checkbox">
+                            <input type="checkbox" name="http-01" ?checked=${overview.challenges.includes('http-01')} ?disabled=${!mayMakeCAs} />
+                            <code>http-01</code>: a token at <code>/.well-known/acme-challenge/</code> of the name - names and addresses, no wildcards
+                        </label>
+                        <label class="checkbox">
+                            <input type="checkbox" name="dns-01" ?checked=${overview.challenges.includes('dns-01')} ?disabled=${!mayMakeCAs} />
+                            <code>dns-01</code>: a TXT record at <code>_acme-challenge</code> below the name, as the name servers of this PKI see it - names and wildcards
+                        </label>
+                        <label>Port http-01 asks at - 80, but on a bench
+                            <input type="number" name="http01Port" min="1" max="65535" value="${overview.http01Port}" ?disabled=${!mayMakeCAs} />
+                        </label>
+
+                        <h3>For whom</h3>
+
+                        <label class="checkbox">
+                            <input type="checkbox" name="externalAccountRequired" ?checked=${overview.externalAccountRequired} ?disabled=${!mayMakeCAs} />
+                            Open an account only with a key of an external account binding, made below by somebody who may sign certificates
+                        </label>
+                        <label>Terms of service a new account agrees to - none by default
+                            <input type="url" name="termsOfService" .value=${overview.termsOfService ?? ''} placeholder="https://pki.example.org/terms" ?disabled=${!mayMakeCAs} />
+                        </label>
+
+                        ${mayMakeCAs ? formActions('acme', 'Save') : nothing}
+
+                    </form>
+
+                </section>
+
+                <section class="card" id="pki-acme-keys">
+
+                    <h2><i class="fa-solid fa-key"></i> Keys of external account bindings</h2>
+
+                    <p class="hint">
+                        A key opens one account, once - as certbot's <code>--eab-kid</code> and <code>--eab-hmac-key</code> take it. Its MAC
+                        key is said once, when it is made, and never again. An account it opened stays when the key is taken away.
+                    </p>
+
+                    ${acmeKeyMade !== null ? html`
+                        <div class="notice" id="acme-key-made" role="status">
+                            <div class="kv"><span class="k">kid</span><span class="v"><code>${acmeKeyMade.kid}</code></span></div>
+                            <div class="kv"><span class="k">hmacKey</span><span class="v"><code id="acme-key-hmac">${acmeKeyMade.hmacKey}</code>
+                                <button type="button" class="btn small" @click=${() => void copyText(acmeKeyMade?.hmacKey ?? '')}>Copy</button></span></div>
+                            <div class="kv"><span class="k">certbot</span><span class="v"><code>certbot register --server ${acmeKeyMade.directory} --eab-kid ${acmeKeyMade.kid} --eab-hmac-key ${acmeKeyMade.hmacKey}</code></span></div>
+                        </div>` : nothing}
+
+                    ${maySign ? html`
+                        <form id="acme-key-form" class="form-stack" @submit=${onNewACMEKey}>
+                            <label>What it is for
+                                <input name="description" placeholder="CSMS 1" />
+                            </label>
+                            <div class="form-actions">
+                                <button type="submit" class="btn primary">Make a key</button>
+                                <span id="acme-key-error" class="form-error" role="alert"></span>
+                            </div>
+                        </form>` : nothing}
+
+                    ${acmeKeys.length === 0 ? html`<p class="hint">No key.</p>` : html`
+                        <div class="table-scroll">
+                            <table class="records acme-keys">
+                                <thead><tr><th>kid</th><th>Description</th><th>Made</th><th>By</th><th>Account</th><th></th></tr></thead>
+                                <tbody>
+                                    ${repeat(acmeKeys, key => key.kid, key => html`
+                                        <tr data-kid="${key.kid}">
+                                            <td><code>${key.kid}</code></td>
+                                            <td>${key.description ?? ''}</td>
+                                            <td>${key.createdAt.slice(0, 10)}</td>
+                                            <td>${key.createdBy}</td>
+                                            <td>${key.boundTo === null ? html`<span class="muted">none yet</span>` : html`<code>${key.boundTo}</code>`}</td>
+                                            <td>${maySign ? html`<button type="button" class="btn small danger" @click=${() => void onRemoveACMEKey(key.kid)}>Take away</button>` : nothing}</td>
+                                        </tr>
+                                    `)}
+                                </tbody>
+                            </table>
+                        </div>`}
+
+                </section>
+
+                <section class="card" id="pki-acme-accounts">
+
+                    <h2><i class="fa-solid fa-users"></i> Accounts</h2>
+
+                    ${acmeAccounts.length === 0 ? html`<p class="hint">No account yet.</p>` : html`
+                        <div class="table-scroll">
+                            <table class="records acme-accounts">
+                                <thead><tr><th>Account</th><th>Status</th><th>Contact</th><th>Key</th><th>Opened</th><th>Vouched for by</th><th>Certificates</th><th></th></tr></thead>
+                                <tbody>
+                                    ${repeat(acmeAccounts, account => account.id, account => html`
+                                        <tr data-account="${account.id}">
+                                            <td><code>${account.id}</code></td>
+                                            <td><span class="chip ${account.status === 'valid' ? 'ok' : 'warn'}">${account.status}</span></td>
+                                            <td>${account.contact.map(contact => contact.replace(/^mailto:/i, '')).join(', ')}</td>
+                                            <td>${account.keyType}</td>
+                                            <td>${account.createdAt.slice(0, 10)}</td>
+                                            <td>${account.vouchedForBy ?? ''}</td>
+                                            <td>${account.certificates}</td>
+                                            <td>${mayMakeCAs && account.status === 'valid'
+                                                      ? html`<button type="button" class="btn small danger" @click=${() => void onDeactivateACMEAccount(account.id)}>Deactivate</button>`
+                                                      : nothing}</td>
+                                        </tr>
+                                    `)}
+                                </tbody>
+                            </table>
+                        </div>`}
+
+                    <span id="acme-accounts-error" class="form-error" role="alert"></span>
+
+                </section>
+            `;
+
+        }
+
+        async function onACME(event: SubmitEvent): Promise<void> {
+
+            event.preventDefault();
+
+            const form   = event.currentTarget as HTMLFormElement;
+            const error  = must<HTMLElement>(content, '#acme-error');
+
+            error.textContent = '';
+
+            const profiles: Record<string, ACMEProfile> = {};
+
+            for (const row of acmeProfiles) {
+                const description = (row.description ?? '').trim();
+                if (row.name.trim().length === 0) {
+                    error.textContent = 'Every profile has a name.';
+                    return;
+                }
+                profiles[row.name.trim()] = { issuer: row.issuer, profile: row.profile, validDays: row.validDays,
+                                              description: description.length > 0 ? description : null };
+            }
+
+            const issuer    = field(form, 'issuer', false);
+            const profile: 'server' | 'client' = form.querySelector<HTMLSelectElement>('select[name="profile"]')?.value === 'client' ? 'client' : 'server';
+            const allowed  = (form.querySelector<HTMLTextAreaElement>('textarea[name="allowedNames"]')?.value ?? '').
+                                  split(/[\s,]+/).map(name => name.trim()).filter(name => name.length > 0);
+            const terms     = field(form, 'termsOfService', false);
+
+            const settings  = {
+                ...(issuer.length > 0 ? { issuer, profile, validDays: numberField(form, 'validDays') } : {}),
+                profiles,
+                externalAccountRequired:  isChecked(form, 'externalAccountRequired'),
+                allowedNames:             allowed,
+                challenges:               ([ 'http-01', 'dns-01' ] as const).filter(challenge => isChecked(form, challenge)),
+                http01Port:               numberField(form, 'http01Port'),
+                termsOfService:           terms.length > 0 ? terms : null
+            };
+
+            try
+            {
+                const saved = await whileSaving(content, must<HTMLElement>(content, '#acme-note'), () => api.pki.setACME(settings));
+                takeACME(saved);
+                draw();
+                must<HTMLElement>(content, '#acme-note').textContent = 'Saved.';
+            }
+            catch (problem)
+            {
+                error.textContent = errorMessage(problem);
+            }
+
+        }
+
+        async function onNewACMEKey(event: SubmitEvent): Promise<void> {
+
+            event.preventDefault();
+
+            const form         = event.currentTarget as HTMLFormElement;
+            const description  = field(form, 'description', false);
+
+            try
+            {
+                acmeKeyMade = await api.pki.newACMEKey(description.length > 0 ? description : null);
+                form.reset();
+                await loadACME();
+            }
+            catch (problem)
+            {
+                must<HTMLElement>(content, '#acme-key-error').textContent = errorMessage(problem);
+            }
+
+        }
+
+        async function onRemoveACMEKey(Kid: string): Promise<void> {
+
+            if (!confirm(`Take the key '${Kid}' away? It opens no account any more; an account it opened stays.`))
+                return;
+
+            try
+            {
+                await api.pki.removeACMEKey(Kid);
+                if (acmeKeyMade?.kid === Kid)
+                    acmeKeyMade = null;
+                await loadACME();
+            }
+            catch (problem)
+            {
+                must<HTMLElement>(content, '#acme-key-error').textContent = errorMessage(problem);
+            }
+
+        }
+
+        async function onDeactivateACMEAccount(Id: string): Promise<void> {
+
+            if (!confirm(`Deactivate the account '${Id}' for good? Its key signs nothing any more; what it was signed stays valid until it is revoked.`))
+                return;
+
+            try
+            {
+                await api.pki.deactivateACMEAccount(Id);
+                await loadACME();
+            }
+            catch (problem)
+            {
+                must<HTMLElement>(content, '#acme-accounts-error').textContent = errorMessage(problem);
+            }
+
+        }
+
+        function takeACME(Overview: ACMEOverview): void {
+            acme               = Overview;
+            acmeProfiles       = Object.entries(Overview.profiles).map(([ name, profile ]) => ({ name, ...profile }));
+            acmeDefaultIssuer  = Overview.issuer ?? '';
+        }
+
+        async function loadACME(): Promise<void> {
+
+            try
+            {
+                const [ loaded, accounts, keys ] = await Promise.all([ api.pki.acme(), api.pki.acmeAccounts(), api.pki.acmeKeys() ]);
+                if (cancelled)
+                    return;
+                takeACME(loaded);
+                acmeAccounts  = accounts;
+                acmeKeys      = keys;
+                acmeProblem   = '';
+            }
+            catch (problem)
+            {
+                if (cancelled)
+                    return;
+                acmeProblem = `What ACME signs could not be loaded: ${errorMessage(problem)}`;
+            }
+
+            draw();
+
+        }
+
+
+        // ------------------------------------------------------------------
         // Loading
         // ------------------------------------------------------------------
 
@@ -2060,6 +2457,9 @@ export const pkiPage: Page = {
 
                 if (shown === 'est')
                     void loadEST();
+
+                if (shown === 'acme')
+                    void loadACME();
 
             }
             catch (problem)

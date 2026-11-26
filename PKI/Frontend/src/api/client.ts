@@ -350,6 +350,71 @@ export interface ESTOverview extends ESTSettings {
     issuers:  { id: string; commonName: string | null; problem: string | null }[];
 }
 
+/** What ACME signs an order as: below which CA, as a server's or a client's certificate, for how long - and what a client is told of it. */
+export interface ACMEProfile {
+    issuer:        string;
+    profile:       'server' | 'client';
+    validDays:     number;
+    description?:  string | null;
+}
+
+/** What ACME - RFC 8555, at "/acme/directory" - signs: by default and as each profile, for which names, proven how, and for whom. */
+export interface ACMESettings extends Partial<ACMEProfile> {
+    profiles:                 Record<string, ACMEProfile>;
+    /** Whether an account is opened only with a key of an external account binding the PKI made. */
+    externalAccountRequired:  boolean;
+    /** The domains and networks ACME signs for; none for every one. */
+    allowedNames:             string[];
+    challenges:               ('http-01' | 'dns-01')[];
+    http01Port:               number;
+    termsOfService:           string | null;
+}
+
+/** The settings, and what the PKI says of them. */
+export interface ACMEOverview extends ACMESettings {
+    enabled:              boolean;
+    path:                 string;
+    https:                boolean;
+    /** Each CA ACME signs with, and why it signs nothing, where it does not. */
+    issuers:              { id: string; commonName: string | null; problem: string | null }[];
+    /** How many accounts are valid, and how many keys of external account bindings opened none yet. */
+    accounts:             number;
+    externalAccountKeys:  number;
+    /** Why the accounts could not be read, where they could not. */
+    problem:              string | null;
+    /** What is said where ACME signs for every name, for everybody who reaches it. */
+    warning:              string | null;
+}
+
+/** An account of ACME: a key, who to write to, and how many certificates it was signed. */
+export interface ACMEAccount {
+    id:               string;
+    status:           'valid' | 'deactivated' | 'revoked';
+    contact:          string[];
+    thumbprint:       string;
+    keyType:          string;
+    createdAt:        string;
+    externalAccount:  string | null;
+    vouchedForBy:     string | null;
+    certificates:     number;
+}
+
+/** A key of an external account binding, as it is listed: without its MAC key. */
+export interface ACMEExternalAccountKey {
+    kid:          string;
+    description:  string | null;
+    createdAt:    string;
+    createdBy:    string;
+    /** The account it opened, once it has. */
+    boundTo:      string | null;
+}
+
+/** A key just made: with its MAC key, said this once. */
+export interface ACMEExternalAccountKeyMade extends ACMEExternalAccountKey {
+    hmacKey:    string;
+    directory:  string;
+}
+
 /** What a deletion took with it. */
 export interface PKIDeleted {
     deleted:  string[];
@@ -387,7 +452,14 @@ export const api = {
         revocation:  ()                                => request<RevocationOverview>    ('GET',    '/pki/revocation'),
         setPublicURL: (publicURL: string | null)       => request<RevocationOverview>    ('PUT',    '/pki/revocation', { publicURL }),
         est:         ()                                => request<ESTOverview>           ('GET',    '/pki/est'),
-        setEST:      (settings: ESTSettings)           => request<ESTOverview>           ('PUT',    '/pki/est', settings)
+        setEST:      (settings: ESTSettings)           => request<ESTOverview>           ('PUT',    '/pki/est', settings),
+        acme:        ()                                => request<ACMEOverview>          ('GET',    '/pki/acme'),
+        setACME:     (settings: ACMESettings)          => request<ACMEOverview>          ('PUT',    '/pki/acme', settings),
+        acmeAccounts: ()                               => request<ACMEAccount[]>         ('GET',    '/pki/acme/accounts'),
+        deactivateACMEAccount: (id: string)            => request<{ id: string; status: string }>('DELETE', `/pki/acme/accounts/${encodeURIComponent(id)}`),
+        acmeKeys:    ()                                => request<ACMEExternalAccountKey[]>('GET',  '/pki/acme/eab'),
+        newACMEKey:  (description: string | null)      => request<ACMEExternalAccountKeyMade>('POST', '/pki/acme/eab', { description }),
+        removeACMEKey: (kid: string)                   => request<void>                  ('DELETE', `/pki/acme/eab/${encodeURIComponent(kid)}`)
     }
 
 };

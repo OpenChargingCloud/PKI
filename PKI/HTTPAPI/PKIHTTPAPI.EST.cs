@@ -225,9 +225,11 @@ namespace cloud.charging.open.PKI
                                      Select(one => $"{(one.Label is null ? "without a label" : $"'{one.Label}'")} as a {one.Profile!.InWords} of {one.Profile.ValidDays} days below '{PKI.Store.Get(one.Profile.IssuerId)?.CommonName ?? one.Profile.IssuerId}'"));
 
         /// <summary>
-        /// Why the given CA signs nothing over EST, or null where it does.
+        /// Why the given CA signs nothing over EST - or over ACME, which signs
+        /// without anybody there just as well - or null where it does.
         /// </summary>
-        private String? ProblemOf(String IssuerId)
+        private String? ProblemOf(String  IssuerId,
+                                  String  Protocol = "EST")
         {
 
             var ca = PKI.Store.Get(IssuerId);
@@ -239,7 +241,7 @@ namespace cloud.charging.open.PKI
                 return "Its private key is not in this PKI.";
 
             if (ca.KeyEncrypted)
-                return "Its private key has a password, and EST signs without anybody there to give it.";
+                return $"Its private key has a password, and {Protocol} signs without anybody there to give it.";
 
             var status = ca.StatusAt(PKI.TimeProvider.GetUtcNow());
 

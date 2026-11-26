@@ -758,6 +758,95 @@ namespace cloud.charging.open.PKI.Issuance
 
         #endregion
 
+        #region TryIssueForNames(...)
+
+        /// <summary>
+        /// A new certificate below a CA of this store for the key of a
+        /// certificate signing request, with the names somebody else proved -
+        /// what ACME signs: the common name and the alternative names given,
+        /// and nothing else of the request but its key.
+        /// </summary>
+        /// <remarks>
+        /// The subject is the common name alone, whatever the request says
+        /// besides: an organization or a country in it was proven by nobody.
+        /// The signature of the request must hold - it is what shows that
+        /// whoever ordered has the key.
+        /// </remarks>
+        /// <param name="IssuerId">The CA that signs it.</param>
+        /// <param name="Profile">A server or a client.</param>
+        /// <param name="CSR">The request, as PEM - or as Base64 of its DER.</param>
+        /// <param name="CommonName">The common name of its subject.</param>
+        /// <param name="AlternativeNames">The names it is valid for: host names, wildcards among them, and addresses.</param>
+        /// <param name="ValidDays">For how many days from now it holds; no longer than its CA.</param>
+        /// <param name="CreatedBy">Who asked for it.</param>
+        public Boolean TryIssueForNames(String                                        IssuerId,
+                                        CertificateProfile                            Profile,
+                                        String                                        CSR,
+                                        String                                        CommonName,
+                                        IReadOnlyList<String>                         AlternativeNames,
+                                        Int32                                         ValidDays,
+                                        String?                                       CreatedBy,
+                                        [NotNullWhen(true)]  out IssuedCertificate?   Certificate,
+                                        [NotNullWhen(false)] out String?              Error,
+                                        out Boolean                                   NotSaved)
+        {
+
+            Certificate  = null;
+            NotSaved     = false;
+
+            if (Profile.IsCA())
+            {
+                Error = "Names proven are signed for a server or a client, never for a CA.";
+                return false;
+            }
+
+            if (!TryLoadCSR(CSR, out var request, out Error))
+                return false;
+
+            if (KeyAlgorithm.Of(request.PublicKey) is null)
+            {
+                Error = $"The CSR is for a key of {KeyAlgorithm.Describe(request.PublicKey)}, which this PKI does not sign: " +
+                        $"{String.Join(", ", KeyAlgorithm.All.Select(algorithm => algorithm.Name))}.";
+                return false;
+            }
+
+            if (AlternativeNames.Count == 0)
+            {
+                Error = "A certificate for names proven has at least one.";
+                return false;
+            }
+
+            foreach (var name in AlternativeNames)
+            {
+                if (!Issuance.AlternativeNames.IsValid(name, out var why))
+                {
+                    Error = why;
+                    return false;
+                }
+            }
+
+            X500DistinguishedName subject;
+
+            try
+            {
+                var builder = new X500DistinguishedNameBuilder();
+                builder.AddCommonName(CommonName);
+                subject = builder.Build();
+            }
+            catch (Exception e) when (e is ArgumentException or CryptographicException)
+            {
+                Error = $"'{CommonName}' is no common name: {e.Message}";
+                return false;
+            }
+
+            return TrySign(IssuerId, null, Profile, subject, CommonName, request.PublicKey, null, null,
+                           ValidDays, AlternativeNames, null, true, CreatedBy, null,
+                           out Certificate, out Error, out NotSaved);
+
+        }
+
+        #endregion
+
         #region (static) TryInspectCSR(CSR, out Inspection, out Error)
 
         /// <summary>
